@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AIDD Chat — 새 대화</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body data-ux="UX-FOCUS-RING">
+    <a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
+    <div data-ux="UX-APP-CANVAS">
+      <!-- One native <dialog> serves all three breakpoints: the 256px navigation
+           column at >= 1024px and the folded Sheet below it, where showModal()
+           supplies the inert background, the focus trap and Esc. It ships `open`,
+           so with no JavaScript the navigation is a plain block in the flow and the
+           menu controls, which would do nothing, are never shown. -->
+      <dialog id="nav-sheet" data-ux="UX-NAV-SHEET" aria-label="주 탐색" open>
+        <a class="brand" href="/">AIDD Chat <small>한국어 Q&amp;A</small></a>
+        <nav class="nav-list" aria-label="대화 탐색">
+          <button type="button" class="secondary" data-new-conversation>＋ 새 대화</button>
+          <a href="#conversation-panel" data-current-conversation>현재 대화</a>
+          <a href="#policy-panel" data-policy-nav>정보·정책</a>
+        </nav>
+        <p class="nav-note">현재 대화는 생성 시점부터 최대 1시간 동안만 유지됩니다.</p>
+        <button class="secondary sheet-close" type="button" data-sheet-close>탐색 메뉴 닫기</button>
+      </dialog>
+      <div class="workspace">
+        <header class="topbar">
+          <span class="topbar-brand">AIDD Chat</span>
+          <!-- The navigation landmark that survives the fold: the dialog is
+               display:none while closed, so its own <nav> is out of the tree. -->
+          <nav aria-label="주 탐색 열기">
+            <button class="secondary" type="button" data-sheet-trigger aria-haspopup="dialog" aria-controls="nav-sheet" aria-expanded="false">탐색 메뉴 열기</button>
+          </nav>
+        </header>
+        <main id="main-content" tabindex="-1">
+          <section id="conversation-panel" class="hero" tabindex="-1" aria-labelledby="page-title">
+            <p class="eyebrow">익명 임시 대화</p>
+            <h1 id="page-title">무엇을 도와드릴까요?</h1>
+            <p>로그인 없이 새 대화를 시작할 수 있습니다.</p>
+            <button class="hero-action secondary" type="button" data-ux="UX-PRIMARY-ACTION" data-new-conversation>새 대화 시작</button>
+            <p id="conversation-status" role="status" aria-live="polite" aria-atomic="true"></p>
+            <section id="transcript" class="transcript" aria-label="대화 내용, 시간 순서"></section>
+            <dl id="run-summary" data-ux="UX-STATUS-ANNOUNCER" hidden>
+              <div><dt>실행 상태</dt><dd data-run-state></dd></div>
+              <div><dt>단계</dt><dd data-run-stage></dd></div>
+              <div><dt>갱신 시각</dt><dd data-run-updated></dd></div>
+            </dl>
+            <p id="context-notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden>
+              대화가 길어져 오래된 대화 일부를 제외했어요.
+            </p>
+            <div data-ux="UX-COMPOSER">
+              <label for="prompt">질문</label>
+              <textarea id="prompt" rows="3" disabled placeholder="질문을 입력해 주세요." aria-describedby="composer-help composer-reason"></textarea>
+              <div class="composer-actions">
+                <button id="send-question" class="secondary" type="button" aria-describedby="composer-reason" disabled>질문 보내기</button>
+                <button id="stop-run" type="button" data-ux="UX-STOP-ACTION" data-stop-action hidden disabled>생성 중지</button>
+              </div>
+            </div>
+            <p id="composer-help" class="notice" role="note">
+              Enter로 전송하고 Shift+Enter로 줄을 바꿉니다. 답변 생성 중에는 다음 질문을 보낼 수 없습니다.
+              생성 중에는 «생성 중지» 버튼으로 답변을 중단할 수 있습니다.
+            </p>
+            <p id="composer-reason" class="notice" data-composer-reason role="status" aria-live="polite" aria-atomic="true"></p>
+            <div id="run-recovery" class="notice" data-ux="UX-RUN-RECOVERY" data-run-recovery hidden>
+              <p data-recovery-message></p>
+              <dl class="recovery-detail">
+                <div><dt>상태</dt><dd data-recovery-state></dd></div>
+                <div><dt>영향</dt><dd data-recovery-impact></dd></div>
+                <div><dt>오류 종류</dt><dd data-recovery-kind></dd></div>
+                <div><dt>재시도 가능 여부</dt><dd data-recovery-retryable></dd></div>
+                <div><dt>Correlation ID</dt><dd data-recovery-correlation></dd></div>
+              </dl>
+              <p class="recovery-reason" id="retry-reason" data-retry-reason></p>
+              <div class="recovery-actions">
+                <button class="secondary" type="button" data-retry-run aria-describedby="retry-reason">재시도</button>
+                <button class="secondary" type="button" data-new-conversation>새 대화</button>
+              </div>
+            </div>
+            <p id="run-announcer" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+            <span id="completed-answer" class="skip-target" tabindex="0" role="note"><span class="visually-hidden">완료 또는 실패한 실행 결과</span></span>
+          </section>
+
+          <section id="policy-panel" class="policy-panel" tabindex="-1" aria-labelledby="policy-title">
+            <h2 id="policy-title">정보·정책</h2>
+            <p id="policy-status" class="policy-status" data-policy-status role="status" aria-live="polite" aria-atomic="true">
+              서비스 준비 상태와 정책을 확인하는 중입니다.
+            </p>
+            <p id="policy-impact" class="notice" data-policy-impact>
+              정책을 확인하는 동안 질문 기능을 사용할 수 없습니다.
+            </p>
+            <button class="secondary" type="button" data-policy-retry hidden>다시 확인</button>
+            <noscript>
+              <p class="notice warning">JavaScript를 사용할 수 없어 서비스 준비 상태와 정책을 확인할 수 없습니다. 질문 기능은 사용할 수 없습니다.</p>
+            </noscript>
+
+            <div data-policy-success hidden>
+              <p class="notice warning">
+                개인정보, 회사 기밀, 비밀번호와 API 키(Credential)를 입력하지 마세요. 공개하거나 합성한 내용만 사용합니다.
+              </p>
+              <p class="notice">세션은 생성 시점부터 1시간이며 영구 저장되지 않습니다.</p>
+
+              <div class="policy-grid">
+                <section class="policy-card" aria-labelledby="runtime-title">
+                  <h3 id="runtime-title">실행 환경</h3>
+                  <dl class="policy-list">
+                    <div><dt>정책 schema</dt><dd data-policy-field="schema_version"></dd></div>
+                    <div><dt>Provider</dt><dd data-policy-field="provider_label"></dd></div>
+                    <div><dt>Endpoint</dt><dd data-policy-field="endpoint_disclosure"></dd></div>
+                    <div><dt>Model revision</dt><dd data-policy-field="model_revision"></dd></div>
+                    <div><dt>처리 지역</dt><dd data-policy-field="processing_region"></dd></div>
+                    <div><dt>Subprocessors</dt><dd data-policy-field="subprocessors"></dd></div>
+                  </dl>
+                </section>
+                <section class="policy-card" aria-labelledby="transfer-title">
+                  <h3 id="transfer-title">Provider 전송 범위</h3>
+                  <dl class="policy-list">
+                    <div><dt>전송 필드</dt><dd data-policy-field="transmitted_fields"></dd></div>
+                    <div><dt>보존</dt><dd data-policy-field="retention_summary"></dd></div>
+                    <div><dt>삭제</dt><dd data-policy-field="deletion_summary"></dd></div>
+                    <div><dt>학습 사용</dt><dd data-policy-field="training_use"></dd></div>
+                  </dl>
+                </section>
+                <section class="policy-card" aria-labelledby="session-title">
+                  <h3 id="session-title">세션과 지식 경계</h3>
+                  <dl class="policy-list">
+                    <div><dt>세션 TTL</dt><dd data-policy-field="session_ttl_seconds"></dd></div>
+                    <div><dt>Retrieval</dt><dd data-policy-field="retrieval_status"></dd></div>
+                    <div><dt>입력 금지 범주</dt><dd data-policy-field="input_warning_categories"></dd></div>
+                  </dl>
+                  <p data-ux="UX-KNOWLEDGE-NOTICE">
+                    답변은 일반 모델에서 생성되며 사내 지식, Knowledge Graph, Vector Search, RAG, Citation에 연결되지 않습니다. 중요한 내용은 별도로 확인해 주세요.
+                  </p>
+                </section>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

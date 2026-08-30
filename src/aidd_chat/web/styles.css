@@ -1,0 +1,221 @@
+/* DESIGN.md's colour palette, type ramp, 4px spacing scale, radii and widths. This
+   block is the only place a literal is allowed: every colour, every font-size and
+   every spacing value below reads a token, so the palette can be contrast-checked
+   and the ramp and the scale can be enforced in one place. */
+:root {
+  --background: #ffffff;
+  --surface: #ffffff;
+  --surface-subtle: #f8fafc;
+  --surface-muted: #f1f5f9;
+  --ink-primary: #172033;
+  --ink-secondary: #475569;
+  --ink-muted: #526173;
+  --border-control: #8793a5;
+  --border-subtle: #e2e8f0;
+  --primary: #004ac6;
+  --primary-hover: #003ea8;
+  --primary-soft: #e8f0ff;
+  --on-primary: #ffffff;
+  --danger: #b42318;
+  --danger-soft: #fef3f2;
+  --warning: #b54708;
+  --warning-soft: #fffaeb;
+  --focus: #004ac6;
+  --scrim: rgba(15, 23, 42, .45);
+  --shadow-soft: 0 4px 16px rgba(15, 23, 42, .06);
+  --text-display: 40px;
+  --text-heading-lg: 28px;
+  --text-heading-md: 20px;
+  --text-body-lg: 17px;
+  --text-body: 15px;
+  --text-label: 13px;
+  --text-caption: 12px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --nav-width: 256px;
+  --reading-width: 896px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  font-family: Pretendard, "Noto Sans KR", "Apple SD Gothic Neo", sans-serif;
+  color: var(--ink-primary);
+  background: var(--background);
+}
+
+* { box-sizing: border-box; }
+/* Deliberately no horizontal clip on the root: clipping would conceal a layout
+   that overflows instead of failing on it, and the acceptance criteria are about
+   the layout, not about hiding its symptoms. */
+html { min-width: 320px; }
+body { margin: 0; min-height: 100vh; background: var(--background); color: var(--ink-primary); font-size: var(--text-body); line-height: 1.6; letter-spacing: -.004em; }
+button, textarea { font: inherit; }
+button, a { touch-action: manipulation; }
+button { min-height: 44px; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .65; }
+a { color: var(--primary); }
+h1, h2, h3 { letter-spacing: -.02em; }
+/* UX-FOCUS-RING lives on <body>: one 2px ring for every interactive descendant,
+   3:1 or better against the white canvas and both subtle surfaces. */
+[data-ux="UX-FOCUS-RING"] :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.skip-link { position: fixed; top: -80px; left: 12px; z-index: 100; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); background: var(--ink-primary); color: var(--on-primary); }
+.skip-link:focus { top: 12px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.skip-target { display: block; height: 1px; }
+
+/* Single column by default. The 256px navigation track only exists at >= 1024px,
+   where the Sheet is the column instead of sitting on top of it. */
+[data-ux="UX-APP-CANVAS"] { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 100vh; background: var(--background); }
+.workspace { display: flex; min-width: 0; flex-direction: column; }
+main { min-width: 0; padding: var(--space-8) var(--space-6); }
+main > section { width: min(100%, var(--reading-width)); margin-inline: auto; }
+
+/* UX-NAV-SHEET is one native <dialog> in three modes, named by app.js in
+   `data-mode`. The bare [open] rule is the column -- and the rendering a browser
+   with no JavaScript (or no <dialog>) gets, since the markup ships it open. */
+[data-ux="UX-NAV-SHEET"] {
+  display: none; flex-direction: column; gap: var(--space-6);
+  margin: 0; padding: var(--space-6) var(--space-4); border: 0;
+  background: var(--surface-subtle); color: var(--ink-primary);
+}
+[data-ux="UX-NAV-SHEET"][open] {
+  display: flex; position: static; width: auto; max-width: none; height: auto; max-height: none;
+  overflow: visible; border-right: 1px solid var(--border-subtle);
+}
+/* Folded behind the trigger. Both folded modes are modal, so the conversation
+   column underneath is inert and cannot be reached by Tab while the navigation is
+   covering it; `panel` is a side sheet, `sheet` takes the full width. */
+[data-ux="UX-NAV-SHEET"][data-mode="panel"][open],
+[data-ux="UX-NAV-SHEET"][data-mode="sheet"][open] {
+  position: fixed; top: 0; right: auto; bottom: 0; left: 0; z-index: 80;
+  width: min(88vw, 320px); max-width: 100%; height: auto; max-height: 100%; overflow: auto;
+  box-shadow: var(--shadow-soft);
+}
+[data-ux="UX-NAV-SHEET"][data-mode="sheet"][open] { width: 100%; border-right: 0; }
+[data-ux="UX-NAV-SHEET"]::backdrop { background: var(--scrim); }
+.brand { color: var(--ink-primary); font-size: var(--text-heading-md); font-weight: 600; text-decoration: none; }
+.brand small { display: block; color: var(--ink-muted); font-size: var(--text-caption); font-weight: 400; }
+.nav-list { display: grid; gap: var(--space-2); }
+.nav-list button, .nav-list a { width: 100%; min-height: 44px; padding: var(--space-3); border: 0; border-radius: var(--radius-md); background: var(--primary-soft); color: var(--ink-primary); text-align: left; text-decoration: none; }
+.nav-note { margin: auto 0 0; color: var(--ink-muted); font-size: var(--text-label); }
+/* The close control and the menu trigger only exist while the navigation is folded.
+   With no JavaScript there is no `data-mode` at all, so neither is offered -- the
+   navigation is simply a block in the flow and nothing on screen is inert. */
+.sheet-close, .topbar { display: none; }
+[data-mode="panel"] .sheet-close, [data-mode="sheet"] .sheet-close { display: inline-block; align-self: flex-start; }
+[data-mode="panel"] ~ .workspace .topbar, [data-mode="sheet"] ~ .workspace .topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-4);
+  padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--border-subtle); background: var(--surface);
+}
+.topbar-brand { font-weight: 600; }
+
+.hero { display: grid; gap: var(--space-5); margin: var(--space-10) auto 0; text-align: center; }
+.hero h1, .hero p { margin: 0; }
+.hero h1 { font-size: var(--text-display); font-weight: 650; line-height: 1.25; letter-spacing: -.025em; }
+.hero > p { font-size: var(--text-body-lg); line-height: 1.65; }
+.eyebrow { color: var(--primary); font-size: var(--text-label); font-weight: 550; }
+
+/* Exactly one control on screen carries UX-PRIMARY-ACTION -- app.js moves the
+   attribute between 새 대화 시작, 질문 보내기 and 재시도 as the screen changes. Every
+   candidate is a secondary control until it is the one being asked for. */
+.secondary { padding: var(--space-2) var(--space-4); border: 1px solid var(--primary); border-radius: var(--radius-md); background: var(--surface); color: var(--primary); }
+[data-ux="UX-PRIMARY-ACTION"] { padding: var(--space-2) var(--space-4); border: 1px solid var(--primary); border-radius: var(--radius-md); background: var(--primary); color: var(--on-primary); transition: background-color .15s ease; }
+[data-ux="UX-PRIMARY-ACTION"]:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
+.hero-action { justify-self: center; }
+[data-policy-retry] { justify-self: start; }
+/* UX-STOP-ACTION is DESIGN.md's quiet secondary: ink on the white surface inside a
+   control border, so it never competes with the one emphasised action. */
+[data-ux="UX-STOP-ACTION"] { padding: var(--space-2) var(--space-4); border: 1px solid var(--border-control); border-radius: var(--radius-md); background: var(--surface); color: var(--ink-secondary); }
+
+[data-ux="UX-COMPOSER"] { display: grid; gap: var(--space-2); padding: var(--space-4); border: 1px solid var(--border-control); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow-soft); text-align: left; }
+[data-ux="UX-COMPOSER"] textarea { width: 100%; padding: var(--space-3); border: 1px solid var(--border-control); border-radius: var(--radius-md); background: var(--surface); color: var(--ink-primary); resize: vertical; }
+[data-ux="UX-COMPOSER"] button { padding-inline: var(--space-4); }
+.composer-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); justify-content: flex-end; }
+/* The reason is a polite Live Region, so it is always rendered -- a region created
+   at announcement time is a region that never announces. Empty it simply has no
+   box: no padding, no border, nothing to see. */
+#composer-reason:empty, .recovery-reason:empty { padding: 0; border: 0; }
+
+/* :not([hidden]) so the attribute selector cannot out-specify the UA hidden rule. */
+[data-ux="UX-RUN-RECOVERY"]:not([hidden]) { display: grid; gap: var(--space-3); border-color: var(--border-subtle); border-radius: var(--radius-lg); background: var(--danger-soft); }
+[data-ux="UX-RUN-RECOVERY"] p { margin: 0; }
+[data-recovery-message] { color: var(--danger); font-weight: 600; }
+.recovery-detail { display: grid; gap: var(--space-2); margin: 0; }
+.recovery-detail div { display: flex; flex-wrap: wrap; gap: var(--space-2); min-width: 0; }
+.recovery-detail dt { color: var(--ink-secondary); font-weight: 600; }
+.recovery-detail dd { margin: 0; overflow-wrap: anywhere; }
+.recovery-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+
+.transcript { display: grid; gap: var(--space-6); text-align: left; }
+.message { min-width: 0; padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); }
+.message p { margin: var(--space-2) 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.message small { display: block; margin: var(--space-2) 0 0; color: var(--ink-secondary); font-size: var(--text-label); }
+/* Which turn is whose is information, so the boundary that carries it has to be
+   perceivable: a white bubble on the white canvas needs a 3:1 edge, not a hairline. */
+[data-ux="UX-USER-MESSAGE"] { justify-self: end; max-width: 80%; border-color: var(--border-control); background: var(--surface); }
+[data-ux="UX-ASSISTANT-RESPONSE"] { max-width: 100%; background: var(--surface-muted); }
+/* The caret beside the 미완료 label, keyed to that label and no other. It is drawn,
+   not written: generated text content cannot be hidden from a screen reader, and a
+   stray block character read after "생성 중인 답변입니다." is noise. */
+@keyframes ux-caret { 50% { opacity: .2; } }
+.incomplete::after {
+  content: ""; display: inline-block; width: 2px; height: 1em; margin: 0 0 0 var(--space-2);
+  vertical-align: text-bottom; background: var(--ink-secondary);
+  animation: ux-caret 1.1s step-end infinite;
+}
+
+/* UX-STATUS-ANNOUNCER is the visible run status: state, content-free stage name and
+   the time it last changed, all as text. #run-announcer beside it is the same facts
+   for a screen reader, announced once per transition. */
+[data-ux="UX-STATUS-ANNOUNCER"]:not([hidden]) { display: flex; flex-wrap: wrap; gap: var(--space-5); margin: 0; padding: var(--space-3) var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-subtle); color: var(--ink-primary); text-align: left; }
+[data-ux="UX-STATUS-ANNOUNCER"] div { display: flex; gap: var(--space-2); }
+[data-ux="UX-STATUS-ANNOUNCER"] dt { font-weight: 600; }
+[data-ux="UX-STATUS-ANNOUNCER"] dd { margin: 0; }
+
+.notice { padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-subtle); color: var(--ink-secondary); text-align: left; }
+.warning { border-color: var(--warning); background: var(--warning-soft); color: var(--ink-primary); }
+[data-ux="UX-KNOWLEDGE-NOTICE"] { margin: var(--space-4) 0 0; padding: var(--space-3); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-subtle); color: var(--ink-secondary); }
+
+.policy-panel { display: grid; gap: var(--space-4); margin: var(--space-10) auto 0; }
+.policy-panel > h2, .policy-panel > p { margin: 0; }
+.policy-panel > h2 { font-size: var(--text-heading-lg); font-weight: 650; line-height: 1.35; }
+.policy-status { font-weight: 600; }
+.policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: var(--space-4); }
+.policy-card { min-width: 0; padding: var(--space-4); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); background: var(--surface-subtle); text-align: left; }
+.policy-card h3 { margin: 0 0 var(--space-3); font-size: var(--text-heading-md); font-weight: 600; }
+.policy-list { display: grid; gap: var(--space-3); margin: 0; }
+.policy-list div { min-width: 0; }
+.policy-list dt { color: var(--ink-secondary); font-size: var(--text-label); font-weight: 550; }
+.policy-list dd { margin: var(--space-1) 0 0; overflow-wrap: anywhere; }
+
+/* < 768px: the sticky top bar the named Sheet hangs off, and tighter gutters. */
+@media (max-width: 767px) {
+  [data-mode="sheet"] ~ .workspace .topbar { position: sticky; top: 0; z-index: 20; }
+  main { padding: var(--space-6) var(--space-4) var(--space-10); }
+  .hero { margin: 0 auto; }
+  .policy-panel { margin: var(--space-10) auto 0; }
+  .composer-actions button { flex: 1 1 auto; }
+}
+
+/* >= 1024px: the navigation is the 256px column. */
+@media (min-width: 1024px) {
+  [data-ux="UX-APP-CANVAS"] { grid-template-columns: var(--nav-width) minmax(0, 1fr); }
+  [data-ux="UX-NAV-SHEET"][open] { min-height: 100vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* Replacement, not removal: the caret stops blinking but stays drawn next to the
+     "생성 중인 답변입니다." label. */
+  .incomplete::after { animation: none !important; opacity: 1; }
+}

@@ -1,0 +1,38 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.tmp-ux-validation/
+.working/
+_bmad/config.user.toml
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+_bmad/render/
+
+# BMAD / agent tooling installed per-machine, not part of the project
+.bmad-loop/
+.codex/
+.claude/settings.json
+.agents/skills/bmad-loop-*/
+.claude/skills/bmad-loop-*/
+_bmad/bmad-loop/
+
+# BMAD installer-generated config (machine- and user-specific)
+_bmad/_config/
+_bmad/bmm/config.yaml
+_bmad/core/config.yaml
+
+# Provider credentials -- values never committed
+.env
+
+# Agent tooling and planning artifacts: regenerated per machine, not part of the shipped app
+.claude/
+.agents/
+_bmad/
+_bmad-output/
+plan.md
+mvp.md
+tests/

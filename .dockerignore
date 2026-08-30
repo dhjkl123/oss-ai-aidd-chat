@@ -1,0 +1,50 @@
+# Second line of defence only. The real guarantee is the Dockerfile's explicit COPY
+# allowlist -- a file no COPY names cannot reach a layer whatever this file says.
+# What this file buys is a smaller build context and a secret that never leaves the
+# working tree for the daemon in the first place.
+#
+# The Build Context does NOT read .gitignore, so every rule is restated here.
+
+# Credentials and keys, in every spelling this repo or a developer might use.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+_netrc
+credentials*.json
+id_rsa*
+*.keystore
+
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.pytest_cache
+dist
+.tmp-ux-validation
+.working
+
+# Agent/BMAD tooling and planning artifacts: not application code, and several of
+# them are machine-specific.
+.agents
+.claude
+.codex
+.bmad-loop
+_bmad
+_bmad-output
+
+# The Image runs the app; it does not run the suite. Playwright is a dev dependency
+# and `uv sync --no-dev` leaves it out, so the Browser tests could not run anyway.
+tests
+docs
+README.md
+Dockerfile
+.dockerignore
+deploy
+mvp.md
+plan.md
