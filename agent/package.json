@@ -1,0 +1,12 @@
+{
+  "name": "aidd-chat-agent",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "test": "node --test" },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.87.1",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@huggingface/tokenizers": "0.2.0"
+  }
+}

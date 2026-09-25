@@ -6,12 +6,16 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from aidd_chat.contracts import (
+    AgentResultV1,
+    AgentStepEventV1,
+    AgentStepV1,
     CompletedMessageV1,
     ContextTruncatedEventV1,
     ConversationExpiredEventV1,
     MessageCompletedEventV1,
     MessageDeltaEventV1,
     MessageDiscardedEventV1,
+    MessageSourcesEventV1,
     PreparedMessageV1,
     PreparedModelRequestV1,
     ProviderFailureV1,
@@ -22,6 +26,7 @@ from aidd_chat.contracts import (
     RunState,
     RunStatusEventV1,
     StreamEndEventV1,
+    WikiSourceV1,
     is_valid_model_text,
 )
 
@@ -155,18 +160,24 @@ def event_size(event: RunEventV1) -> int:
     bytes. `run.status`, `run.error`, `stream.end` and the `message.completed` echo
     of the whole answer are all counted, which is the part that was missing."""
     text = getattr(event, "text", None)
-    if not isinstance(text, str):
-        return EVENT_ENVELOPE_BYTES
-    return EVENT_ENVELOPE_BYTES + len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
+    if isinstance(text, str):
+        return EVENT_ENVELOPE_BYTES + len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
+    if isinstance(event, (AgentStepEventV1, MessageSourcesEventV1)):
+        # Titles and paths vary by orders of magnitude, like text does.
+        return EVENT_ENVELOPE_BYTES + len(event.model_dump_json().encode("utf-8"))
+    return EVENT_ENVELOPE_BYTES
 
 
 def _completed_echo(
     run: "Run", content: str, now: datetime, sequence: int | None = None
 ) -> RunEventV1:
     """The `message.completed` this Run would write if it finished with `content`.
-    Built only to be measured -- the Replay ceiling has to account for the answer
-    appearing in the log a second time, escaped."""
-    return MessageCompletedEventV1(
+    Built only to be measured, never recorded -- `model_construct` skips
+    `MessageCompletedEventV1`'s visible-text validator, because a mid-stream
+    `content` (raw_buffer + one delta) may still be whitespace-only while the
+    eventual completed answer is not. Visibility is enforced separately, by
+    `commit_completed`, before any Event carrying `content` is actually recorded."""
+    return MessageCompletedEventV1.model_construct(
         run_id=run.run_id,
         sequence=len(run.events) + 1 if sequence is None else sequence,
         occurred_at=now,
@@ -227,6 +238,10 @@ class Message:
     content: str
     created_at: datetime
     state: Literal["completed"] = "completed"
+    outcome: str | None = None
+    sources: tuple[WikiSourceV1, ...] = ()
+    search_truncated: bool = False
+    uncovered: str | None = None
 
 
 @dataclass
@@ -250,7 +265,7 @@ class Run:
     terminal_error: ProviderFailureV1 | None = None
     events: list[RunEventV1] = field(default_factory=list)
     raw_buffer: str = ""
-    # SHA-256 of the ProviderBindingV1 snapshot this Run was actually sent to.
+    # SHA-256 of the agent binding snapshot this Run was actually sent to.
     # Internal traceability only -- deliberately absent from RunProjectionV1.
     provider_binding_digest: str | None = None
     # The Deadline, twice. `deadline_at` is the wall-clock value, kept for the
@@ -269,6 +284,7 @@ class Run:
     # so the ceiling costs one addition per Event rather than a re-walk of the log.
     # Counted over the whole envelope, because that is what actually occupies memory.
     replay_bytes: int = 0
+    step_count: int = 0
 
     def past_deadline(self, monotonic_now: float) -> bool:
         """The clock arrives as an argument, like every `now` in this module: the
@@ -683,6 +699,28 @@ class ConversationAggregate:
         )
         return True
 
+    def commit_step(self, expected_active_run_id: UUID, step: AgentStepV1, now: datetime) -> bool:
+        """AD-29 progress. Run progress, never a Message: it does not touch
+        raw_buffer, and a Run that is not running refuses it like a late delta."""
+        if self.is_expired():
+            return False
+        run = self.runs.get(expected_active_run_id)
+        if run is None or self.active_run_id != expected_active_run_id or run.state != "running":
+            return False
+        if step.step_index != run.step_count + 1:
+            return False
+        event = AgentStepEventV1(
+            run_id=run.run_id, sequence=len(run.events) + 1, occurred_at=now, step=step
+        )
+        if len(run.events) + 1 + TERMINAL_EVENT_HEADROOM > self.limits.max_replay_events:
+            raise OutputLimitExceeded
+        if run.replay_bytes + event_size(event) + TERMINAL_EVENT_BYTE_HEADROOM > self.limits.max_replay_bytes:
+            raise OutputLimitExceeded
+        run.step_count += 1
+        run.last_updated_at = now
+        _record(run, event)
+        return True
+
     def commit_delta(self, expected_active_run_id: UUID, text: str, now: datetime) -> bool:
         if self.is_expired() or not is_valid_model_text(text):
             return False
@@ -729,7 +767,9 @@ class ConversationAggregate:
         if projected > self.limits.max_replay_bytes:
             raise OutputLimitExceeded
 
-    def commit_completed(self, expected_active_run_id: UUID, content: str, now: datetime) -> bool:
+    def commit_completed(
+        self, expected_active_run_id: UUID, content: str, result: AgentResultV1, now: datetime
+    ) -> bool:
         if self.is_expired() or not is_valid_model_text(content, require_visible=True):
             return False
         run = self.runs.get(expected_active_run_id)
@@ -739,23 +779,32 @@ class ConversationAggregate:
             or run.state not in {"queued", "running"}
         ):
             return False
-        # The non-streaming path never passed through commit_delta, so this is the
-        # only place a `complete`-only Provider's answer is ever sized -- and that is
-        # the path the real Ollama binding can take. All three ceilings, not just the
-        # output one: this Run is about to append four Events, one of which repeats
-        # the entire answer.
-        completed_sequence = len(run.events) + 1
-        echo = _completed_echo(run, content, now, sequence=completed_sequence)
+        first = len(run.events) + 1
+        sources_event = MessageSourcesEventV1(
+            run_id=run.run_id,
+            sequence=first,
+            occurred_at=now,
+            message_id=run.reserved_output_message_id,
+            outcome=result.outcome,
+            sources=result.sources,
+            search_truncated=result.search_truncated,
+            uncovered=result.uncovered,
+        )
+        echo = _completed_echo(run, content, now, sequence=first + 1)
         if len(content.encode("utf-8")) > self.limits.max_output_bytes:
             raise OutputLimitExceeded
-        if completed_sequence + 2 > self.limits.max_replay_events:
+        if first + 3 > self.limits.max_replay_events:
             raise OutputLimitExceeded
         if (
-            run.replay_bytes + event_size(echo) + TERMINAL_EVENT_BYTE_HEADROOM
-            > self.limits.max_replay_bytes
+            run.replay_bytes + event_size(sources_event) + event_size(echo)
+            + TERMINAL_EVENT_BYTE_HEADROOM > self.limits.max_replay_bytes
         ):
             raise OutputLimitExceeded
-        assistant = Message(run.reserved_output_message_id, "assistant", content, now)
+        assistant = Message(
+            run.reserved_output_message_id, "assistant", content, now,
+            outcome=result.outcome, sources=result.sources,
+            search_truncated=result.search_truncated, uncovered=result.uncovered,
+        )
         self.messages.append(assistant)
         run.state = "completed"
         run.stage = "terminal"
@@ -763,26 +812,18 @@ class ConversationAggregate:
         run.last_updated_at = now
         _record(
             run,
+            sources_event,
             MessageCompletedEventV1(
-                run_id=run.run_id,
-                sequence=completed_sequence,
-                occurred_at=now,
-                message_id=assistant.message_id,
-                text=content,
+                run_id=run.run_id, sequence=first + 1, occurred_at=now,
+                message_id=assistant.message_id, text=content,
             ),
             RunStatusEventV1(
-                run_id=run.run_id,
-                sequence=completed_sequence + 1,
-                occurred_at=now,
-                state="completed",
-                stage="terminal",
+                run_id=run.run_id, sequence=first + 2, occurred_at=now,
+                state="completed", stage="terminal",
             ),
             StreamEndEventV1(
-                run_id=run.run_id,
-                sequence=completed_sequence + 2,
-                occurred_at=now,
-                final_state="completed",
-                final_sequence=completed_sequence + 2,
+                run_id=run.run_id, sequence=first + 3, occurred_at=now,
+                final_state="completed", final_sequence=first + 3,
             ),
         )
         self.active_run_id = None
@@ -792,6 +833,7 @@ class ConversationAggregate:
         self,
         expected_active_run_id: UUID,
         content: str,
+        result: AgentResultV1,
         mismatch_failure: ProviderFailureV1,
         now: datetime,
     ) -> bool:
@@ -810,7 +852,7 @@ class ConversationAggregate:
             or not is_valid_model_text(content, require_visible=True)
         ):
             return self._commit_failed(run, mismatch_failure, now)
-        return self.commit_completed(expected_active_run_id, content, now)
+        return self.commit_completed(expected_active_run_id, content, result, now)
 
     def commit_failed(
         self,
@@ -925,7 +967,7 @@ class ConversationAggregate:
         # the value this Run has carried since it was accepted.
         # model_validate, not model_copy(update=...): the latter SKIPS validators,
         # which is how a non-v4 UUID would reach the public failure envelope
-        # unchecked -- the same bypass `binding_digest` re-validates against.
+        # unchecked -- the same bypass `agent_binding_json` re-validates against.
         failure = ProviderFailureV1.model_validate(
             {**failure.model_dump(), "correlation_id": run.correlation_id}
         )
@@ -971,7 +1013,11 @@ class ConversationAggregate:
         output = None
         if run.output_message_id is not None:
             message = next(item for item in self.messages if item.message_id == run.output_message_id)
-            output = CompletedMessageV1(message_id=message.message_id, content=message.content)
+            output = CompletedMessageV1(
+                message_id=message.message_id, content=message.content,
+                outcome=message.outcome, sources=message.sources,
+                search_truncated=message.search_truncated, uncovered=message.uncovered,
+            )
         return RunProjectionV1(
             run_id=run.run_id,
             conversation_id=run.conversation_id,

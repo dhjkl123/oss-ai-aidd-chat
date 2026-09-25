@@ -7,6 +7,7 @@ from typing import Annotated
 import asyncio
 import json
 import logging
+import mimetypes
 import time
 import unicodedata
 from uuid import UUID, uuid4
@@ -54,6 +55,9 @@ _RUN_COMMAND = TypeAdapter(RunCommandV1)
 
 
 WEB_ROOT = Path(__file__).with_name("web")
+# Windows' registry has no entry for .woff2, so StaticFiles would send the
+# self-hosted font as application/octet-stream.
+mimetypes.add_type("font/woff2", ".woff2")
 SSE_KEEPALIVE_SECONDS = 15
 # At most this many X-Forwarded-For entries are ever parsed. The header is written
 # by the client; without a cap it is an unbounded allocation on every request.
@@ -189,7 +193,7 @@ class EventStreamResponse(StreamingResponse):
 # level. Package roots only -- each gets propagate=False, so every child is silenced
 # with it and naming children would be noise. `uvicorn.error` is deliberately NOT
 # here: it carries startup failures and no request content, and it is what reports a
-# refused public_demo Guard.
+# refused configuration.
 #
 # That last one rests on an invariant rather than on a filter: uvicorn.error is also
 # where an escaping ASGI traceback lands, and a pydantic ValidationError message
@@ -205,8 +209,6 @@ _SILENCED_LOGGERS = (
     "urllib3",
     "anyio",
     "asyncio",
-    "openai",
-    "pydantic_ai",
 )
 
 
@@ -268,6 +270,11 @@ async def security_headers(request: Request, call_next):
     )
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    # The shell and its assets carry an ETag but no freshness, so a browser would
+    # cache them heuristically and could pair a new index.html with an old app.js.
+    # no-cache keeps the ETag round-trip (a 304 when unchanged) and never mixes.
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers.setdefault("Cache-Control", "no-cache")
     return response
 
 
@@ -299,8 +306,7 @@ def capacity_response(exc: CapacityExceeded, chat: ChatApplication) -> JSONRespo
 
     Also the single point where every ceiling refusal in the process is observed:
     the Code goes into the Telemetry Record's `error_class`, and nothing else does.
-    `chat` is required, with no default, for exactly the reason the public_demo
-    Guards moved inside `build_provider`: an optional observation is one the next
+    `chat` is required, with no default: an optional observation is one the next
     caller forgets, and forgetting it silently restores Story 1.8's unobserved
     ceilings."""
     chat.record_capacity_refusal(exc.reason)

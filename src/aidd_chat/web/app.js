@@ -24,12 +24,26 @@ const navSheet = document.querySelector("[data-ux='UX-NAV-SHEET']");
 const sheetTrigger = document.querySelector("[data-sheet-trigger]");
 const sheetClose = document.querySelector("[data-sheet-close]");
 const mainContent = document.querySelector("#main-content");
-const heroAction = document.querySelector(".hero-action");
+const conversationPanel = document.querySelector("#conversation-panel");
+const policyPanel = document.querySelector("#policy-panel");
+const viewLinks = [...document.querySelectorAll("[data-current-conversation], [data-policy-nav]")];
+const navNew = document.querySelector("[data-ux='UX-NAV-SHEET'] [data-new-conversation]");
 const policyStatus = document.querySelector("#policy-status");
 const policyImpact = document.querySelector("[data-policy-impact]");
 const policyRetry = document.querySelector("[data-policy-retry]");
 const policySuccess = document.querySelector("[data-policy-success]");
 const policyFields = [...document.querySelectorAll("[data-policy-field]")];
+const agentSteps = document.querySelector("[data-agent-steps]");
+const sourceTemplate = document.querySelector("#source-list-template");
+const iconTemplate = document.querySelector("#icons");
+const thinkButton = document.querySelector("[data-think]");
+const thinkLabel = document.querySelector("[data-think-label]");
+const thinkDetail = document.querySelector("#run-detail");
+const composerPill = document.querySelector("[data-pill]");
+const sideToggle = document.querySelector("[data-side-toggle]");
+const convTitle = document.querySelector("[data-conv-title]");
+const convTtl = document.querySelector("[data-conv-ttl]");
+const currentConversationLink = document.querySelector("[data-current-conversation]");
 
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/;
@@ -89,9 +103,21 @@ const PROVIDER_FAILURES = new Set([
   "provider_timeout", "provider_cancelled", "provider_non_text", "provider_empty",
   "provider_incomplete", "provider_suspended", "provider_interrupted",
   "provider_invalid_response", "provider_content_filtered", "provider_unknown",
-  "capacity_exceeded",
+  "capacity_exceeded", "agent_runtime_unavailable", "wiki_unavailable",
 ]);
-const EVENT_TYPES = ["run.status", "message.delta", "message.completed", "message.discarded", "run.error", "context.truncated", "conversation.expired", "stream.end"];
+// CompletedMessageV1 (AD-29): outcome/sources/search_truncated/uncovered ride beside
+// the answer text on every completed Run, and this story renders them: the source
+// list, the partial/search-limit notices and the wiki_gap/out_of_scope labels below.
+const OUTCOMES = new Set(["grounded", "partial", "wiki_gap", "out_of_scope", "meta"]);
+const SOURCED_OUTCOMES = new Set(["grounded", "partial"]);
+const SOURCE_CONFIDENCE = new Set(["high", "medium", "low"]);
+const OUTCOME_LABELS = { wiki_gap: "Wiki 보충 대상", out_of_scope: "Wiki 범위 밖" };
+const EVENT_TYPES = ["run.status", "message.delta", "message.completed", "message.discarded", "run.error", "context.truncated", "conversation.expired", "stream.end", "agent.step", "message.sources"];
+// AD-29 fixed Korean templates, one per AgentStepKind -- verbatim, never a search term or tool argument.
+const STEP_PREFIXES = {
+  wiki_index: "Wiki 목록 확인", wiki_search: "Wiki 검색 중", wiki_read: "문서 읽는 중: ",
+  decide: "근거 판단 중", compose: "답변 작성 중", limit_reached: "검색 한도 도달",
+};
 const RUN_STAGES = {
   queued: ["queued"], running: ["preparing", "streaming", "finalizing"],
   completed: ["terminal"], failed: ["terminal"], timeout: ["terminal"], cancelled: ["terminal"],
@@ -105,6 +131,9 @@ const POLL_TIMEOUT_MS = 2_000;
 const MAX_POLL_RETRIES = 3;
 
 let conversationId = null;
+// The 현재 대화 item: the conversation's first question and its expiry.
+let conversationTitle = "";
+let conversationExpiresAt = null;
 let generation = 0;
 let policyReady = false;
 let run = null;
@@ -152,7 +181,6 @@ function disabledReason() {
   // Switching first: a creation already in flight is the more useful thing to say
   // than either "start a conversation" or a verdict on the one being replaced.
   if (conversationSwitching) return "새 대화를 만드는 중에는 질문을 보낼 수 없습니다.";
-  if (!conversationId) return "새 대화를 시작하면 질문을 보낼 수 있습니다.";
   if (conversationFailedClosed) return "이 대화는 더 이상 사용할 수 없습니다. 새 대화를 시작해 주세요.";
   if (pendingSubmit || pendingRetry) return "이전 요청을 보내는 중에는 질문을 보낼 수 없습니다.";
   // Terminal but not yet reconciled: the answer is on screen and nothing is being
@@ -174,10 +202,11 @@ function announceReason(text) {
 }
 
 // UX-PRIMARY-ACTION is a role, not an element: exactly one control on screen may
-// carry it, and it is whichever single action this screen is asking for.
+// carry it, and it is whichever single action this screen is asking for. There is
+// no start gate: the empty screen already asks for the first question.
 function setPrimaryAction() {
-  const primary = !recovery.hidden ? retryButton : (conversationId ? sendButton : heroAction);
-  for (const control of [heroAction, sendButton, retryButton]) {
+  const primary = !recovery.hidden ? retryButton : sendButton;
+  for (const control of [sendButton, retryButton]) {
     if (control === primary) control.dataset.ux = "UX-PRIMARY-ACTION";
     else delete control.dataset.ux;
   }
@@ -185,7 +214,10 @@ function setPrimaryAction() {
 
 function updateComposer() {
   setPrimaryAction();
-  const enabled = policyReady && conversationId && !conversationSwitching && !conversationFailedClosed
+  syncNavCurrent();
+  // No conversation yet is not a reason to close the composer: the first submit
+  // creates one (submitQuestion).
+  const enabled = policyReady && !conversationSwitching && !conversationFailedClosed
     && !pendingSubmit && !pendingRetry
     && (!run || (TERMINAL_STATES.has(run.state) && run.reconciled));
   announceReason(enabled ? "" : disabledReason());
@@ -198,6 +230,9 @@ function updateComposer() {
   const stoppable = Boolean(run) && run.generation === generation && ACTIVE_STATES.has(run.state);
   stopButton.hidden = !stoppable;
   stopButton.disabled = !stoppable || Boolean(run && run.cancelPending);
+  // Send and stop are one circle in the pill: ■ replaces ↑ while the Run can stop.
+  sendButton.hidden = stoppable;
+  composerPill.classList.toggle("tall", prompt.scrollHeight > 30);
   if (enabled) composerLostFocus = false;
   else if (closingOnFocus) composerLostFocus = true;
   // Disabling the element that holds focus drops focus on <body>. Hand it to the
@@ -279,6 +314,8 @@ function renderRun(state, stage) {
   runState.textContent = STATE_LABELS[state] || state;
   runStage.textContent = STAGE_LABELS[stage] || stage;
   runUpdated.textContent = formatTime(run.updatedAt);
+  if (TERMINAL_STATES.has(state)) collapseSteps();
+  syncThink();
   announceState(state);
   if (RECOVERABLE_STATES.has(state)) renderRecovery(state, run.terminalError);
   updateComposer();
@@ -300,6 +337,8 @@ function renderRecovery(state, failure) {
   retryButton.disabled = !canRetry();
   retryReason.textContent = (run && run.retryBlockedReason) || "";
   recovery.hidden = false;
+  // The card carries the failure; the answer slot keeps it only for a screen reader.
+  if (run && state !== "cancelled") run.assistant.article.classList.add("failed");
 }
 
 function canRetry() {
@@ -335,20 +374,29 @@ function disposeRun() {
 // is left is always a correct prefix and labelling on append keeps the numbering
 // honest without re-walking the list.
 function labelMessage(article) {
-  const position = transcript.children.length;
+  // Articles only: notices, the action row and the source card sit between turns.
+  const position = transcript.querySelectorAll(":scope > article").length;
   article.setAttribute("aria-label", article.dataset.ux === "UX-USER-MESSAGE"
-    ? `${position}번째 메시지, 내 질문` : `${position}번째 메시지, AIDD Chat 답변`);
+    ? `${position}번째 메시지, 내 질문` : `${position}번째 메시지, Cite 답변`);
 }
 
 function newMessage(role, text, incomplete = false) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
   article.dataset.ux = role === "user" ? "UX-USER-MESSAGE" : "UX-ASSISTANT-RESPONSE";
+  // Visually hidden: bubble side and surface already say whose turn it is, and the
+  // article's aria-label (labelMessage) carries role and position for a screen reader.
   const label = document.createElement("strong");
-  label.textContent = role === "user" ? "나" : "AIDD Chat";
-  const content = document.createElement("p");
-  content.textContent = text;
+  label.className = "visually-hidden";
+  label.textContent = role === "user" ? "나" : "Cite";
+  // The question is shown as typed; the answer is Markdown (renderAnswer).
+  const content = document.createElement(role === "user" ? "p" : "div");
   article.append(label, content);
+  if (role === "user") content.textContent = text;
+  else {
+    content.className = "md";
+    renderAnswer(content, text, incomplete);
+  }
   let note = null;
   if (incomplete) {
     note = document.createElement("small");
@@ -361,19 +409,135 @@ function newMessage(role, text, incomplete = false) {
   return { article, content, note };
 }
 
+function element(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function icon(name) {
+  return iconTemplate.content.querySelector(`[data-icon="${name}"]`).cloneNode(true);
+}
+
+// Copy: the answer's own Markdown source, or one code block's exact text. Swaps to
+// ✓ 복사됨 for a moment. No clipboard (an insecure origin) simply does nothing.
+function copyButton(text, labelled) {
+  const button = element("button", labelled ? "ghost" : "icon-btn");
+  button.type = "button";
+  const show = (done) => {
+    button.replaceChildren(icon(done ? "check" : "copy"));
+    if (labelled) button.append(element("span", "", done ? "복사됨" : "복사"));
+    button.setAttribute("aria-label", done ? "복사됨" : (labelled ? "코드 복사" : "답변 복사"));
+  };
+  show(false);
+  button.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(text()); } catch { return; }
+    show(true);
+    setTimeout(() => show(false), 1400);
+  });
+  return button;
+}
+
+function inlineNodes(parent, nodes) {
+  for (const node of nodes) {
+    parent.append(node.type === "text" ? document.createTextNode(node.text)
+      : element(node.type === "code" ? "code" : "strong", "", node.text));
+  }
+  return parent;
+}
+
+// Model text becomes DOM through markdown.js's AST and textContent only -- never
+// markup, never a link, never an image. Re-parsed whole on every delta; an open
+// fence while streaming is a code block without its copy button.
+function renderAnswer(container, text, streaming) {
+  // Blocks already on screen and unchanged are kept (a closed code block keeps its
+  // copy button, its 복사됨 and its focus); only the first changed block and what
+  // follows is rebuilt. The key includes whether the copy button is withheld.
+  const blocks = Markdown.parseBlocks(text);
+  const keys = blocks.map((block) => JSON.stringify(block) + (streaming && block.open ? "|open" : ""));
+  const kept = container.blockKeys || [];
+  let same = 0;
+  while (same < keys.length && same < kept.length && keys[same] === kept[same]) same += 1;
+  while (container.children.length > same) container.lastElementChild.remove();
+  container.blockKeys = keys;
+  for (const block of blocks.slice(same)) {
+    if (block.type === "code") {
+      const box = element("div", "codeblock");
+      const head = element("div", "code-head");
+      head.append(element("span", "", block.lang || "code"));
+      if (!(block.open && streaming)) head.append(copyButton(() => block.text, true));
+      box.append(head, element("pre", "", block.text));
+      container.append(box);
+    } else if (block.type === "heading") container.append(inlineNodes(element("h3"), block.inline));
+    else if (block.type === "ul" || block.type === "ol") {
+      const list = element(block.type);
+      for (const item of block.items) list.append(inlineNodes(element("li"), item));
+      container.append(list);
+    } else container.append(inlineNodes(element("p"), block.inline));
+  }
+}
+
+function toggleThink(button, detail) {
+  const open = button.getAttribute("aria-expanded") !== "true";
+  button.setAttribute("aria-expanded", String(open));
+  detail.hidden = !open;
+}
+thinkButton.addEventListener("click", () => toggleThink(thinkButton, thinkDetail));
+
+// The thinking line: the current step (or Run state) while the Run is active,
+// "Wiki N단계 확인" once it settles, nothing for a settled Run that took no step.
+function syncThink() {
+  const active = ACTIVE_STATES.has(run.state);
+  thinkLabel.textContent = active ? (run.lastStepLabel || STATE_LABELS[run.state]) : `Wiki ${run.steps.length}단계 확인`;
+  thinkButton.classList.toggle("live", active);
+  thinkButton.hidden = !active && !run.steps.length;
+}
+
+// UX-STATUS-ANNOUNCER is one element that follows the live Run. Parked beside the
+// transcript (visually hidden) whenever there is no answer for it to sit in.
+function parkSummary() {
+  if (runSummary.parentElement !== conversationPanel) transcript.after(runSummary);
+}
+
+// Before it moves on, the answer it described keeps a plain copy of its settled
+// line and step list -- no ids, no live state.
+function freezeSummary() {
+  if (!runSummary.closest("article") || thinkButton.hidden) return;
+  const button = thinkButton.cloneNode(true);
+  for (const name of ["data-think", "aria-controls"]) button.removeAttribute(name);
+  button.querySelector("[data-think-label]").removeAttribute("data-think-label");
+  button.classList.remove("live");
+  button.setAttribute("aria-expanded", "false");
+  const steps = agentSteps.cloneNode(true);
+  steps.removeAttribute("data-agent-steps");
+  const detail = element("div", "think-detail");
+  detail.hidden = true;
+  detail.append(steps);
+  button.addEventListener("click", () => toggleThink(button, detail));
+  const block = element("div", "think-block");
+  block.append(button, detail);
+  runSummary.replaceWith(block);
+}
+
 function validConversation(value) {
   return exactKeys(value, ["conversation_id", "created_at", "expires_at"])
     && UUID_V4.test(value.conversation_id) && validTimestamp(value.created_at) && validTimestamp(value.expires_at);
 }
 
-async function createConversation() {
+// `implicit` is the first submit creating the conversation it is about to post
+// into: nothing to announce, since the question itself is what appears next. A
+// click passes its Event here, so only a literal `true` counts. Resolves to whether
+// a conversation was created.
+async function createConversation(implicit) {
+  implicit = implicit === true;
   const request = new AbortController();
   if (newConversationController) newConversationController.abort();
   newConversationController = request;
   conversationSwitching = true;
   for (const control of controls) control.disabled = true;
   updateComposer();
-  status.textContent = "새 대화를 만드는 중입니다.";
+  status.textContent = implicit ? "" : "새 대화를 만드는 중입니다.";
   const timeout = setTimeout(() => request.abort(), 3_000);
   try {
     const response = await fetch("/api/v1/conversations", {
@@ -399,18 +563,30 @@ async function createConversation() {
     run = null;
     pendingSubmit = null;
     conversationId = created.conversation_id;
+    conversationTitle = "";
+    conversationExpiresAt = Date.parse(created.expires_at);
     conversationFailedClosed = false;
     recovery.hidden = true;
+    parkSummary();
     transcript.replaceChildren();
     runSummary.hidden = true;
     contextNotice.hidden = true;
-    status.textContent = "빈 새 대화를 만들었습니다. 1시간 동안 유지됩니다.";
+    status.textContent = implicit ? "" : "빈 새 대화를 만들었습니다. 1시간 동안 유지됩니다.";
+    return true;
   } catch (error) {
     if (request === newConversationController) {
+      // Only claim an existing conversation was kept when there is one. On the
+      // first question there is none; what is kept is the question in the composer.
+      const timedOut = error.name === "AbortError" ? " 시간이 초과되어 요청을 중단했습니다." : "";
       if (error.notice) status.textContent = error.notice;
-      else status.textContent = error.name === "AbortError"
-        ? "새 대화를 만들지 못했습니다. 시간이 초과되어 요청을 중단했습니다. 다시 시도해 주세요."
-        : "새 대화를 만들지 못했습니다. 기존 대화를 유지합니다. 다시 시도해 주세요.";
+      else if (implicit) {
+        status.textContent = `대화를 시작하지 못해 질문을 보내지 못했습니다.${timedOut} 질문은 입력란에 그대로 있어요. 다시 보내 주세요.`;
+      } else if (timedOut) status.textContent = `새 대화를 만들지 못했습니다.${timedOut} 다시 시도해 주세요.`;
+      else {
+        status.textContent = conversationId
+          ? "새 대화를 만들지 못했습니다. 기존 대화를 유지합니다. 다시 시도해 주세요."
+          : "새 대화를 만들지 못했습니다. 다시 시도해 주세요.";
+      }
     }
   } finally {
     clearTimeout(timeout);
@@ -419,9 +595,64 @@ async function createConversation() {
     for (const control of controls) control.disabled = false;
     updateComposer();
   }
+  return false;
 }
 
 for (const control of controls) control.addEventListener("click", createConversation);
+
+// 대화 and 정보·정책 are two screens of one page, switched by fragment so Back and a
+// reload land where the user was. Only the two screen fragments switch; any other
+// fragment (the skip link) leaves the current screen alone.
+function showView(hash) {
+  if (hash !== "#policy-panel" && hash !== "#conversation-panel" && hash !== "") return;
+  const policy = hash === "#policy-panel";
+  policyPanel.hidden = !policy;
+  conversationPanel.hidden = policy;
+  document.title = policy ? "Cite — 정보·정책" : "Cite — 대화";
+  syncNavCurrent();
+}
+
+// The navigation marks where the user is: 정보·정책, the empty 새 대화 screen (the
+// same test the stylesheet's :has uses for the start layout), or 현재 대화.
+function syncNavCurrent() {
+  const start = !transcript.children.length && recovery.hidden && runSummary.hidden;
+  const current = !policyPanel.hidden ? viewLinks.find((link) => link.hasAttribute("data-policy-nav"))
+    : (start ? navNew : viewLinks.find((link) => link.hasAttribute("data-current-conversation")));
+  for (const node of [navNew, ...viewLinks]) {
+    if (node === current) node.setAttribute("aria-current", "page");
+    else node.removeAttribute("aria-current");
+  }
+  prompt.placeholder = start ? "llm-wiki에 물어보세요" : "후속 질문하기";
+  syncConversationItem();
+}
+
+// 현재 대화 names the conversation by its first question and says how long it has
+// left (expires_at). With no conversation it is plain 현재 대화 -- still the way
+// back from 정보·정책 to the conversation screen (EXPERIENCE).
+function syncConversationItem() {
+  const title = conversationId && conversationTitle ? conversationTitle : "현재 대화";
+  if (convTitle.textContent !== title) convTitle.textContent = title;
+  currentConversationLink.title = title;
+  const left = conversationId && conversationExpiresAt
+    ? Math.ceil((conversationExpiresAt - Date.now()) / 60_000) : 0;
+  const ttl = left > 0 ? `${left}분 남음` : "";
+  if (convTtl.textContent !== ttl) convTtl.textContent = ttl;
+}
+setInterval(syncConversationItem, 30_000);
+// Switched on click, before the navigation's own handler hands focus to the
+// destination: a still-hidden screen could not take it.
+for (const link of viewLinks) link.addEventListener("click", () => showView(link.getAttribute("href")));
+// 새 대화 always lands on the conversation screen, and says so in the address.
+for (const control of controls) {
+  control.addEventListener("click", () => {
+    if (location.hash === "#policy-panel") history.pushState(null, "", "#conversation-panel");
+    showView("#conversation-panel");
+  });
+}
+window.addEventListener("hashchange", () => showView(location.hash));
+// On load every fragment resolves to one screen: a reload at #main-content (the
+// skip link) or any other non-screen fragment is the conversation screen.
+showView(location.hash === "#policy-panel" ? "#policy-panel" : "");
 
 // UX-NAV-SHEET is one native <dialog> in three modes, named in `data-mode` so the
 // stylesheet and the tests can see which one is live:
@@ -554,6 +785,32 @@ if (dialogReady) {
   sheetClose.hidden = true;
 }
 
+// The >= 1024px sidebar folds to a 52px icon rail: the toggle, Ctrl/Cmd+Shift+S, and
+// the choice remembered per browser. Below 1024px the Sheet owns the navigation and
+// this does nothing (the stylesheet only applies `data-side` in the column).
+const SIDE_KEY = "cite-sidebar";
+function setSide(collapsed, remember = true) {
+  document.documentElement.dataset.side = collapsed ? "collapsed" : "open";
+  const label = collapsed ? "사이드바 열기" : "사이드바 닫기";
+  sideToggle.setAttribute("aria-label", label);
+  sideToggle.title = label;
+  sideToggle.setAttribute("aria-expanded", String(!collapsed));
+  if (remember) {
+    try { localStorage.setItem(SIDE_KEY, collapsed ? "collapsed" : "open"); } catch { /* not remembered */ }
+  }
+}
+sideToggle.addEventListener("click", () => setSide(document.documentElement.dataset.side !== "collapsed"));
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "s"
+    && navSheet.dataset.mode === "column") {
+    event.preventDefault();
+    sideToggle.click();
+  }
+});
+let savedSide = null;
+try { savedSide = localStorage.getItem(SIDE_KEY); } catch { savedSide = null; }
+setSide(savedSide === "collapsed", false);
+
 prompt.addEventListener("input", updateComposer);
 prompt.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -565,12 +822,27 @@ sendButton.addEventListener("click", () => void submitQuestion());
 
 async function submitQuestion() {
   const content = prompt.value;
-  if (!conversationId || !visibleText(content) || pendingSubmit || (run && !TERMINAL_STATES.has(run.state))) return;
+  if (!visibleText(content) || pendingSubmit || (run && !TERMINAL_STATES.has(run.state))) return;
+  if (!conversationId) {
+    // The first question creates its conversation. Creation closes the composer for
+    // a moment, which drops focus on <body>; give it back so the handoff to 생성 중지
+    // below works exactly as it does for every later question.
+    if (conversationSwitching) return;
+    const hadFocus = document.activeElement === prompt || document.activeElement === sendButton;
+    const created = await createConversation(true);
+    if (hadFocus && document.activeElement === document.body && !prompt.disabled) prompt.focus({ preventScroll: true });
+    if (created) await submitQuestion();
+    return;
+  }
   const body = JSON.stringify({ kind: "question", content });
   const submit = { content, body, key: crypto.randomUUID(), generation, attempts: 0, controller: null };
   pendingSubmit = submit;
   prompt.value = "";
   submit.userMessage = newMessage("user", content);
+  // The question the user just sent opens the view, with its answer growing under
+  // it -- the composer is pinned over the bottom of the page. Scroll only; focus
+  // stays where the user left it.
+  submit.userMessage.article.scrollIntoView({ block: "start" });
   updateComposer();
   await postQuestion(submit);
 }
@@ -676,6 +948,122 @@ function validProjectionBase(value) {
     && RUN_STAGES[value.state]?.includes(value.stage);
 }
 
+// WikiSourceV1: mirrors the contract's shape and its path rule -- the source list
+// renders `path` as text (never a link), but a path outside the Wiki root or
+// escaping it via ".." must still fail closed here, the same as
+// validate_wiki_path does server-side.
+function validSource(value) {
+  return exactKeys(value, ["path", "title", "confidence", "contested"])
+    && typeof value.path === "string" && visibleText(value.path)
+    && value.path.endsWith(".md") && !value.path.startsWith("/") && !value.path.includes("..")
+    && visibleText(value.title) && (value.confidence === null || SOURCE_CONFIDENCE.has(value.confidence))
+    && typeof value.contested === "boolean";
+}
+
+// The outcome/sources/search_truncated/uncovered shape, shared by CompletedMessageV1
+// below and by the message.sources Event that carries the same four fields ahead of
+// it. Mirrors contracts.py's _check_outcome_fields server-side, checked closed like
+// every other payload here -- including the no-duplicate-path rule, since the source
+// list below renders one `li` per source in array order.
+function validOutcome(value) {
+  return OUTCOMES.has(value.outcome) && Array.isArray(value.sources) && value.sources.every(validSource)
+    && SOURCED_OUTCOMES.has(value.outcome) === (value.sources.length > 0)
+    && new Set(value.sources.map((source) => source.path)).size === value.sources.length
+    && typeof value.search_truncated === "boolean"
+    && (value.outcome === "partial") === (value.uncovered !== null)
+    && (value.uncovered === null || visibleText(value.uncovered));
+}
+
+function outcomeOf(value) {
+  return { outcome: value.outcome, sources: value.sources, search_truncated: value.search_truncated,
+    uncovered: value.uncovered };
+}
+
+function sameOutcome(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+// CompletedMessageV1: same outcome/sources consistency contracts.py enforces
+// server-side (_check_outcome_fields), checked closed like every other payload here.
+function validCompletedMessage(message, messageId) {
+  return exactKeys(message, ["message_id", "content", "outcome", "sources", "search_truncated", "uncovered"])
+    && message.message_id === messageId && visibleText(message.content) && validOutcome(message);
+}
+
+function badge(text, className) {
+  return element("span", `badge ${className}`, text);
+}
+
+function notice(text) {
+  const node = element("p", "outcome-notice");
+  node.dataset.ux = "UX-KNOWLEDGE-NOTICE";
+  node.append(icon("info"), element("span", "", text));
+  return node;
+}
+
+// Rendered once per completed answer, right after its article: the notices, the
+// action row (copy + the 근거 문서 N pill) and the source card the pill opens. Text
+// only: titles and paths come from Wiki files and are untrusted (AD-23), so
+// textContent, never HTML, and never a link. Every node this appends is also kept on
+// `target.outcomeNodes`, so a completed answer that a later contradictory projection
+// forces closed (C-10.4: no confirmed source list on a failed/cancelled Run) can
+// have them stripped by removeOutcome.
+function renderOutcome(target, value) {
+  if (target.outcomeRendered) return;
+  target.outcomeRendered = true;
+  const after = [];
+  target.outcomeNodes = [];
+  const label = OUTCOME_LABELS[value.outcome];
+  if (label) {
+    const tag = element("span", "outcome-label", label);
+    target.assistant.article.append(tag);
+    target.outcomeNodes.push(tag);
+  }
+  if (value.outcome === "partial") after.push(notice(`Wiki에 없는 부분: ${value.uncovered}`));
+  if (value.search_truncated) after.push(notice("Wiki 검색이 한도에서 끝났어요."));
+  const actions = element("div", "actions");
+  const answer = target.buffer;
+  actions.append(copyButton(() => answer, false));
+  after.push(actions);
+  if (SOURCED_OUTCOMES.has(value.outcome)) {
+    const section = sourceTemplate.content.firstElementChild.cloneNode(true);
+    const list = section.querySelector("ul");
+    for (const source of value.sources) {
+      const item = element("li");
+      item.append(element("span", "source-title", source.title));
+      if (source.contested) item.append(badge("논쟁 중", "contested"));
+      if (source.confidence === "low") item.append(badge("신뢰도 낮음", "low-confidence"));
+      item.append(element("span", "source-path", source.path));
+      list.append(item);
+    }
+    section.id = `sources-${crypto.randomUUID()}`;
+    const toggle = element("button", "sources-btn");
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.setAttribute("aria-controls", section.id);
+    const dot = element("span", "dot", "W");
+    dot.setAttribute("aria-hidden", "true");
+    toggle.append(dot, `근거 문서 ${value.sources.length}`);
+    toggle.addEventListener("click", () => toggleThink(toggle, section));
+    actions.append(toggle);
+    after.push(section);
+  }
+  target.assistant.article.after(...after);
+  target.outcomeNodes.push(...after);
+}
+
+// The renderOutcome undo: a completed answer's source list, notices and label are
+// confirmed only once the Run's terminal state is confirmed. A contradictory
+// projection (a mismatch failClosedRun fails on, or an outcome that disagrees with
+// what the SSE message.sources Event already committed to) must leave none of them
+// on screen (C-10.4).
+function removeOutcome(target) {
+  if (!target || !target.outcomeNodes) return;
+  for (const node of target.outcomeNodes) node.remove();
+  target.outcomeNodes = [];
+  target.outcomeRendered = false;
+}
+
 function validProjection(value) {
   if (!validProjectionBase(value)) return false;
   if (["queued", "running", "cancelled"].includes(value.state)) {
@@ -683,9 +1071,7 @@ function validProjection(value) {
   }
   if (value.state === "completed") {
     return UUID_V4.test(value.output_message_id)
-      && exactKeys(value.output_message, ["message_id", "content"])
-      && value.output_message.message_id === value.output_message_id
-      && visibleText(value.output_message.content) && value.terminal_error === null;
+      && validCompletedMessage(value.output_message, value.output_message_id) && value.terminal_error === null;
   }
   return ["failed", "timeout"].includes(value.state)
     && value.output_message_id === null && value.output_message === null && validFailure(value.terminal_error);
@@ -695,7 +1081,17 @@ function startRun(projection, question, userMessage) {
   disposeRun();
   contextNotice.hidden = true;
   recovery.hidden = true;
+  // The card just went away: a failed answer it stood for shows again, quietly.
+  for (const failed of transcript.querySelectorAll(":scope > .failed")) {
+    failed.classList.replace("failed", "failed-settled");
+  }
+  if (!conversationTitle) conversationTitle = question.trim();
+  freezeSummary();
   const assistant = newMessage("assistant", "", true);
+  // The thinking line sits in the answer it describes, above the answer text.
+  assistant.article.insertBefore(runSummary, assistant.content);
+  thinkButton.setAttribute("aria-expanded", "false");
+  thinkDetail.hidden = true;
   run = {
     id: projection.run_id, generation, state: "queued", stage: "queued",
     cursor: 0, buffer: "", messageId: null, terminalMessage: null, terminalError: null,
@@ -705,7 +1101,9 @@ function startRun(projection, question, userMessage) {
     question, userMessage, cancelPending: false, cancelRendered: false, cancelTimer: null,
     stopHadFocus: false, focusPrompt: false, expired: false,
     updatedAt: projection.last_updated_at,
+    steps: [], lastStepLabel: null, outcome: null, outcomeNodes: [],
   };
+  agentSteps.replaceChildren();
   if (TERMINAL_STATES.has(projection.state)) {
     if (!reconcileProjection(projection, false, true)) return failClosedRun();
     disposeRun();
@@ -882,6 +1280,7 @@ function renderCancelled() {
   run.cancelTimer = null;
   run.focusPrompt = run.stopHadFocus;
   run.buffer = "";
+  parkSummary();
   run.assistant.article.remove();
   // The Turn was never answered; leaving the question in the transcript would show
   // it twice the moment the user resends it.
@@ -919,6 +1318,44 @@ function receiveEvent(type, event) {
   run.updatedAt = value.occurred_at;
   if (!applyEvent(value)) return malformedStream();
   run.cursor = sequence;
+}
+
+function validStep(step, expectedIndex) {
+  if (!exactKeys(step, ["step_index", "kind", "label", "doc_path"]) || step.step_index !== expectedIndex
+    || !Object.hasOwn(STEP_PREFIXES, step.kind) || typeof step.label !== "string") return false;
+  const prefix = STEP_PREFIXES[step.kind];
+  if (step.kind === "wiki_read") {
+    return step.label.startsWith(prefix) && visibleText(step.label.slice(prefix.length))
+      && typeof step.doc_path === "string" && step.doc_path.endsWith(".md");
+  }
+  return step.label === prefix && step.doc_path === null;
+}
+
+// "완료 "/"진행 중 " are visually hidden: the list reads as plain labels, and the
+// state of each step is still text, not colour.
+function stepItem(label, done) {
+  const item = element("li", done ? "done" : "current");
+  item.dataset.label = label;
+  item.append(element("span", "visually-hidden", done ? "완료 " : "진행 중 "), label);
+  return item;
+}
+
+function renderStep(step) {
+  const previous = agentSteps.lastElementChild;
+  if (previous) previous.replaceWith(stepItem(previous.dataset.label, true));
+  agentSteps.append(stepItem(step.label, false));
+  // One polite announcement per new step; an identical label is not repeated (EXPERIENCE).
+  if (step.label !== run.lastStepLabel) {
+    run.lastStepLabel = step.label;
+    announcer.textContent = step.label;
+  }
+  syncThink();
+}
+
+// A settled Run: every step is done; the line collapses to "Wiki N단계 확인".
+function collapseSteps() {
+  const last = agentSteps.lastElementChild;
+  if (last && last.classList.contains("current")) last.replaceWith(stepItem(last.dataset.label, true));
 }
 
 function applyEvent(event) {
@@ -964,7 +1401,7 @@ function applyEvent(event) {
     if (!exactKeys(event, [...base, "error"]) || run.terminalMessage !== "discarded"
       || run.terminalError || run.terminalStatus || !validFailure(event.error)) return false;
     run.terminalError = event.error;
-    run.assistant.content.textContent = event.error.message;
+    renderAnswer(run.assistant.content, event.error.message, false);
     return true;
   }
   if (event.type === "stream.end") {
@@ -990,6 +1427,13 @@ function applyEvent(event) {
     setTimeout(() => startPolling(true), 0);
     return true;
   }
+  if (event.type === "agent.step") {
+    if (!exactKeys(event, [...base, "step"]) || !run.sawRunning || run.terminalMessage || run.terminalStatus
+      || run.end || !validStep(event.step, run.steps.length + 1)) return false;
+    run.steps.push(event.step);
+    renderStep(event.step);
+    return true;
+  }
   if (run.terminalMessage || run.terminalStatus || run.end) return false;
   // The one message event a still-queued Run can emit: a Cancel committed before
   // mark_running opens the log at sequence 1 with no run.status(running) ahead of
@@ -1001,17 +1445,26 @@ function applyEvent(event) {
       || !rawChunk(event.text) || (run.messageId && run.messageId !== event.message_id)) return false;
     run.messageId = event.message_id;
     run.buffer += event.text;
-    run.assistant.content.textContent = run.buffer;
+    renderAnswer(run.assistant.content, run.buffer, true);
+    return true;
+  }
+  if (event.type === "message.sources") {
+    if (!exactKeys(event, [...base, "message_id", "outcome", "sources", "search_truncated", "uncovered"])
+      || !UUID_V4.test(event.message_id) || (run.messageId && run.messageId !== event.message_id)
+      || run.outcome || !validOutcome(event)) return false;
+    run.messageId = event.message_id;
+    run.outcome = outcomeOf(event);
     return true;
   }
   if (event.type === "message.completed") {
     if (!exactKeys(event, [...base, "message_id", "text"]) || !UUID_V4.test(event.message_id)
       || !visibleText(event.text) || (run.messageId && run.messageId !== event.message_id)
-      || (run.buffer && event.text !== run.buffer)) return false;
+      || (run.buffer && event.text !== run.buffer) || !run.outcome) return false;
     run.messageId = event.message_id;
     run.buffer = event.text;
     run.terminalMessage = "completed";
-    run.assistant.content.textContent = event.text;
+    renderOutcome(run, run.outcome);
+    renderAnswer(run.assistant.content, event.text, false);
     if (run.assistant.note) run.assistant.note.remove();
     return true;
   }
@@ -1023,7 +1476,7 @@ function applyEvent(event) {
     run.terminalMessage = "discarded";
     // Kept even though a Cancel removes the bubble a tick later: if SSE drops
     // between the discard and run.error, an empty bubble is all the user would get.
-    run.assistant.content.textContent = "답변을 완료하지 못했습니다.";
+    renderAnswer(run.assistant.content, "답변을 완료하지 못했습니다.", false);
     if (run.assistant.note) run.assistant.note.remove();
     return true;
   }
@@ -1062,6 +1515,9 @@ function expireConversation() {
   run.reconciled = true;
   run.buffer = "";
   conversationFailedClosed = true;
+  conversationTitle = "";
+  conversationExpiresAt = null;
+  parkSummary();
   transcript.replaceChildren();
   runSummary.hidden = true;
   recovery.hidden = true;
@@ -1157,11 +1613,19 @@ function reconcileProjection(value, afterEnd, accepted = false) {
     if ((run.messageId && run.messageId !== value.output_message_id)
       || (run.buffer && run.buffer !== value.output_message.content)) return false;
     if (afterEnd && (run.terminalStatus !== "completed" || run.terminalMessage !== "completed")) return false;
+    if (run.outcome && !sameOutcome(run.outcome, outcomeOf(value.output_message))) return false;
     run.messageId = value.output_message_id;
     run.buffer = value.output_message.content;
-    run.assistant.content.textContent = value.output_message.content;
+    renderAnswer(run.assistant.content, value.output_message.content, false);
     if (run.assistant.note) run.assistant.note.remove();
+    run.outcome = outcomeOf(value.output_message);
+    renderOutcome(run, run.outcome);
   } else if (["failed", "timeout"].includes(value.state)) {
+    // The same cross-check the cancelled branch carries: a failed/timeout
+    // projection arriving after message.completed was applied must not overwrite
+    // an answer the user already has (or the source list/notices/label rendered
+    // beside it -- C-10.4).
+    if (run.terminalMessage === "completed") return false;
     if (run.terminalError && !sameFailure(run.terminalError, value.terminal_error)) return false;
     if (afterEnd && (run.terminalStatus !== value.state || run.terminalMessage !== "discarded"
       || !sameFailure(run.terminalError, value.terminal_error))) return false;
@@ -1169,7 +1633,7 @@ function reconcileProjection(value, afterEnd, accepted = false) {
     // the recovery panel needs the same kind/retryability/Correlation ID either way.
     run.terminalError = value.terminal_error;
     run.buffer = "";
-    run.assistant.content.textContent = value.terminal_error.message;
+    renderAnswer(run.assistant.content, value.terminal_error.message, false);
     if (run.assistant.note) run.assistant.note.remove();
   } else if (value.state === "cancelled") {
     // The same cross-check the completed/failed branches carry: a cancelled
@@ -1195,6 +1659,11 @@ function failClosedRun() {
   disposeRun();
   run.buffer = "";
   run.reconciled = false;
+  // A source list, notice or label rendered from an answer this client now
+  // refuses to stand behind must not survive it (C-10.4) -- e.g. a grounded
+  // stream whose final projection then mismatches, or whose outcome disagrees
+  // with what message.sources already committed to (~1319).
+  removeOutcome(run);
   // renderCancelled detaches the bubble; a message written into a detached node
   // is a message the user never sees.
   // A cancelled turn detached both bubbles, so this one re-enters an emptied
@@ -1203,7 +1672,8 @@ function failClosedRun() {
     transcript.append(run.assistant.article);
     labelMessage(run.assistant.article);
   }
-  run.assistant.content.textContent = "실행 상태를 안전하게 확인할 수 없습니다.";
+  run.assistant.article.classList.remove("failed");
+  renderAnswer(run.assistant.content, "실행 상태를 안전하게 확인할 수 없습니다.", false);
   if (run.assistant.note) run.assistant.note.remove();
   conversationFailedClosed = true;
   status.textContent = "실행 상태를 안전하게 확인할 수 없습니다. 새 대화를 시작해 주세요.";
@@ -1228,15 +1698,14 @@ window.addEventListener("pageshow", () => {
 const POLICY_RATE_RETRIES = 2;
 const POLICY_RETRY_MS = 400;
 const MAX_POLICY_TEXT_LENGTH = 256;
-const MAX_SUBPROCESSOR_COUNT = 32;
-const MAX_SUBPROCESSOR_LABEL_LENGTH = 128;
 const POLICY_KEYS = [
-  "schema_version", "provider_label", "endpoint_disclosure", "model_revision", "transmitted_fields",
-  "retention_summary", "deletion_summary", "training_use", "processing_region", "subprocessors",
-  "session_ttl_seconds", "retrieval_status", "input_warning_categories",
+  "schema_version", "provider_label", "model_revision", "transmitted_fields",
+  "session_ttl_seconds", "retrieval_status", "wiki_display_name",
 ].sort();
-const TRANSMITTED_FIELD_LABELS = { system_instruction: "시스템 안내", current_message: "현재 질문", selected_prior_messages: "선택된 이전 메시지" };
-const INPUT_WARNING_LABELS = { personal_information: "개인정보", company_confidential_data: "회사 기밀", credentials: "Credential·비밀번호·API 키" };
+const TRANSMITTED_FIELD_LABELS = {
+  system_instruction: "시스템 안내", current_message: "현재 질문", selected_prior_messages: "선택된 이전 메시지",
+  wiki_excerpts: "읽은 Wiki 발췌",
+};
 const UNKNOWN_POLICY_PATTERN = /(?:unknown|undefined|not[ _-]?configured|unavailable|(?:^|[\s_:/-])n\/?a(?:$|[\s_:/-])|none|null|미정|미확정|알\s*수\s*없음)/i;
 const UNSAFE_POLICY_PATTERN = /(?:secret|credential|password|token|api[_ -]?key|authorization|bearer|private[_ -]?(?:endpoint|route|network|host|routing)|internal[_ -]?(?:endpoint|route|network|host|routing)|query(?:[_ -]?string)?|trace|raw[_ -]?response|stack[_ -]?trace|debug|response[_ -]?(?:body|headers?)|chain[_ -]?of[_ -]?thought|intermediate|cookie|jwt|oauth|https?:\/\/|[?&])/i;
 
@@ -1254,19 +1723,10 @@ function safeRuntimeText(value, maxLength = MAX_POLICY_TEXT_LENGTH) {
 }
 function isExactPolicy(value) {
   return exactKeys(value, POLICY_KEYS) && value.schema_version === "1"
-    && safeRuntimeText(value.provider_label) && safeRuntimeText(value.endpoint_disclosure, 64)
-    && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.endpoint_disclosure)
-    && !/(localhost|private|internal)/.test(value.endpoint_disclosure)
-    && !/(\.local|\.internal)$/.test(value.endpoint_disclosure)
-    && !/^\d+(?:\.\d+){3}$/.test(value.endpoint_disclosure) && safeRuntimeText(value.model_revision)
+    && safeRuntimeText(value.provider_label) && safeRuntimeText(value.model_revision)
     && sameItems(value.transmitted_fields, Object.keys(TRANSMITTED_FIELD_LABELS))
-    && safeRuntimeText(value.retention_summary) && safeRuntimeText(value.deletion_summary)
-    && ["not_used", "provider_policy"].includes(value.training_use) && safeRuntimeText(value.processing_region)
-    && Array.isArray(value.subprocessors) && value.subprocessors.length <= MAX_SUBPROCESSOR_COUNT
-    && value.subprocessors.every((item) => safeRuntimeText(item, MAX_SUBPROCESSOR_LABEL_LENGTH))
-    && new Set(value.subprocessors).size === value.subprocessors.length
-    && value.session_ttl_seconds === 3600 && value.retrieval_status === "disabled"
-    && sameItems(value.input_warning_categories, Object.keys(INPUT_WARNING_LABELS));
+    && value.session_ttl_seconds === 3600 && value.retrieval_status === "wiki_readonly"
+    && safeRuntimeText(value.wiki_display_name, 128);
 }
 function clearPolicyFields() { for (const field of policyFields) field.textContent = ""; }
 function showPolicyUnavailable() {
@@ -1277,11 +1737,9 @@ function showPolicyUnavailable() {
 }
 function renderPolicy(policy) {
   const values = {
-    ...policy, subprocessors: policy.subprocessors.length ? policy.subprocessors.join(" · ") : "없음",
+    ...policy,
     transmitted_fields: policy.transmitted_fields.map((item) => TRANSMITTED_FIELD_LABELS[item]).join(" · "),
-    training_use: policy.training_use === "not_used" ? "사용하지 않음" : "Provider 정책에 따름",
-    session_ttl_seconds: `${policy.session_ttl_seconds.toLocaleString("ko-KR")}초 (1시간)`, retrieval_status: "비활성화(disabled)",
-    input_warning_categories: policy.input_warning_categories.map((item) => INPUT_WARNING_LABELS[item]).join(" · "),
+    session_ttl_seconds: `${policy.session_ttl_seconds.toLocaleString("ko-KR")}초 (1시간)`, retrieval_status: "Wiki 읽기 전용",
   };
   for (const field of policyFields) field.textContent = values[field.dataset.policyField] || "";
   policyReady = true; updateComposer(); policyStatus.textContent = "서비스 준비 상태와 공개 정책을 확인했습니다.";

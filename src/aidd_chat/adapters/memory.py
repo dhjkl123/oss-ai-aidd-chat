@@ -11,6 +11,8 @@ from uuid import UUID
 
 from aidd_chat.application import Conversation
 from aidd_chat.contracts import (
+    AgentResultV1,
+    AgentStepV1,
     PreparedMessageV1,
     PreparedModelRequestV1,
     ProviderFailureV1,
@@ -539,11 +541,26 @@ class InMemoryConversationStore:
                 return False
             return state.commit_context_truncated(expected_active_run_id, dropped_turn_count, now)
 
-    def commit_completed(self, conversation_id: UUID, expected_active_run_id: UUID, content: str, now: datetime) -> bool:
+    def commit_completed(
+        self,
+        conversation_id: UUID,
+        expected_active_run_id: UUID,
+        content: str,
+        result: AgentResultV1,
+        now: datetime,
+    ) -> bool:
         with self._live(conversation_id) as state:
             if state is None:
                 return False
-            return state.commit_completed(expected_active_run_id, content, now)
+            return state.commit_completed(expected_active_run_id, content, result, now)
+
+    def commit_step(
+        self, conversation_id: UUID, expected_active_run_id: UUID, step: AgentStepV1, now: datetime
+    ) -> bool:
+        with self._live(conversation_id) as state:
+            if state is None:
+                return False
+            return state.commit_step(expected_active_run_id, step, now)
 
     def commit_delta(
         self, conversation_id: UUID, expected_active_run_id: UUID, text: str, now: datetime
@@ -558,6 +575,7 @@ class InMemoryConversationStore:
         conversation_id: UUID,
         expected_active_run_id: UUID,
         content: str,
+        result: AgentResultV1,
         mismatch_failure: ProviderFailureV1,
         now: datetime,
     ) -> bool:
@@ -565,7 +583,7 @@ class InMemoryConversationStore:
             if state is None:
                 return False
             return state.commit_stream_completed(
-                expected_active_run_id, content, mismatch_failure, now
+                expected_active_run_id, content, result, mismatch_failure, now
             )
 
     def commit_failed(

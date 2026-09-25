@@ -3,66 +3,80 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>AIDD Chat — 새 대화</title>
+    <title>Cite — 새 대화</title>
     <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body data-ux="UX-FOCUS-RING">
     <a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
     <div data-ux="UX-APP-CANVAS">
-      <!-- One native <dialog> serves all three breakpoints: the 256px navigation
-           column at >= 1024px and the folded Sheet below it, where showModal()
+      <!-- One native <dialog> serves all three breakpoints: the 260px sidebar (or its
+           52px icon rail) at >= 1024px and the folded Sheet below it, where showModal()
            supplies the inert background, the focus trap and Esc. It ships `open`,
            so with no JavaScript the navigation is a plain block in the flow and the
            menu controls, which would do nothing, are never shown. -->
       <dialog id="nav-sheet" data-ux="UX-NAV-SHEET" aria-label="주 탐색" open>
-        <a class="brand" href="/">AIDD Chat <small>한국어 Q&amp;A</small></a>
+        <div class="side-top">
+          <a class="brand" href="/">
+            <span class="mark" aria-hidden="true"><svg viewBox="0 0 18 18" fill="currentColor"><path d="M4 13.5c-.8 0-1.5-.7-1.5-1.6 0-2.6 1.3-5 3.6-6.4l.8 1.1C5.6 7.6 5 8.7 4.9 9.8c1 .1 1.8.9 1.8 1.9 0 1-.8 1.8-1.8 1.8H4zm6.5 0c-.8 0-1.5-.7-1.5-1.6 0-2.6 1.3-5 3.6-6.4l.8 1.1c-1.3 1-1.9 2.1-2 3.2 1 .1 1.8.9 1.8 1.9 0 1-.8 1.8-1.8 1.8h-.9z"/><circle cx="15" cy="13" r="1.3"/></svg></span>
+            <span class="brand-text"><span class="brand-name">Cite</span> <small>모든 답에 근거 문서를</small></span>
+          </a>
+          <button class="icon-btn side-toggle" type="button" data-side-toggle aria-label="사이드바 닫기" title="사이드바 닫기" aria-expanded="true"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="3"/><path d="M7.5 3.5v13"/></svg></button>
+          <button class="icon-btn sheet-close" type="button" data-sheet-close aria-label="탐색 메뉴 닫기" title="탐색 메뉴 닫기"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15"/></svg></button>
+        </div>
         <nav class="nav-list" aria-label="대화 탐색">
-          <button type="button" class="secondary" data-new-conversation>＋ 새 대화</button>
-          <a href="#conversation-panel" data-current-conversation>현재 대화</a>
-          <a href="#policy-panel" data-policy-nav>정보·정책</a>
+          <button type="button" class="item" data-new-conversation title="새 대화"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M10 3.5H5.5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V10"/><path d="M14.8 2.9l2.3 2.3-7 7H7.8V9.9z"/></svg><span class="label">새 대화</span></button>
+          <a href="#conversation-panel" class="item" data-current-conversation title="현재 대화"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><path d="M4 4.5h12a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H9l-4 3v-3H4a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z"/></svg><span class="label"><span class="conv-title" data-conv-title>현재 대화</span><span class="conv-ttl" data-conv-ttl></span></span></a>
+          <a href="#policy-panel" class="item" data-policy-nav title="정보·정책"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="10" cy="10" r="7"/><path d="M10 9v4.5M10 6.5v.2" stroke-linecap="round"/></svg><span class="label">정보·정책</span></a>
         </nav>
         <p class="nav-note">현재 대화는 생성 시점부터 최대 1시간 동안만 유지됩니다.</p>
-        <button class="secondary sheet-close" type="button" data-sheet-close>탐색 메뉴 닫기</button>
       </dialog>
       <div class="workspace">
         <header class="topbar">
-          <span class="topbar-brand">AIDD Chat</span>
           <!-- The navigation landmark that survives the fold: the dialog is
                display:none while closed, so its own <nav> is out of the tree. -->
           <nav aria-label="주 탐색 열기">
-            <button class="secondary" type="button" data-sheet-trigger aria-haspopup="dialog" aria-controls="nav-sheet" aria-expanded="false">탐색 메뉴 열기</button>
+            <button class="icon-btn" type="button" data-sheet-trigger aria-haspopup="dialog" aria-controls="nav-sheet" aria-expanded="false" aria-label="탐색 메뉴 열기" title="탐색 메뉴 열기"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="2.5" y="3.5" width="15" height="13" rx="3"/><path d="M7.5 3.5v13"/></svg></button>
           </nav>
+          <span class="topbar-brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 18 18" fill="currentColor"><path d="M4 13.5c-.8 0-1.5-.7-1.5-1.6 0-2.6 1.3-5 3.6-6.4l.8 1.1C5.6 7.6 5 8.7 4.9 9.8c1 .1 1.8.9 1.8 1.9 0 1-.8 1.8-1.8 1.8H4zm6.5 0c-.8 0-1.5-.7-1.5-1.6 0-2.6 1.3-5 3.6-6.4l.8 1.1c-1.3 1-1.9 2.1-2 3.2 1 .1 1.8.9 1.8 1.9 0 1-.8 1.8-1.8 1.8h-.9z"/><circle cx="15" cy="13" r="1.3"/></svg></span>Cite</span>
         </header>
         <main id="main-content" tabindex="-1">
-          <section id="conversation-panel" class="hero" tabindex="-1" aria-labelledby="page-title">
-            <p class="eyebrow">익명 임시 대화</p>
-            <h1 id="page-title">무엇을 도와드릴까요?</h1>
-            <p>로그인 없이 새 대화를 시작할 수 있습니다.</p>
-            <button class="hero-action secondary" type="button" data-ux="UX-PRIMARY-ACTION" data-new-conversation>새 대화 시작</button>
-            <p id="conversation-status" role="status" aria-live="polite" aria-atomic="true"></p>
+          <!-- Readiness belongs to both screens: while the policy is loading or could
+               not be confirmed it says why the composer is closed and offers 다시 확인.
+               Once ready it steps out of view; the status stays a live region. -->
+          <div class="readiness">
+            <p id="policy-status" class="policy-status" data-policy-status role="status" aria-live="polite" aria-atomic="true">
+              서비스 준비 상태와 정책을 확인하는 중입니다.
+            </p>
+            <p id="policy-impact" class="notice" data-policy-impact>
+              정책을 확인하는 동안 질문 기능을 사용할 수 없습니다.
+            </p>
+            <button class="pill-btn" type="button" data-policy-retry hidden>다시 확인</button>
+          </div>
+          <section id="conversation-panel" class="conversation" tabindex="-1" aria-labelledby="page-title">
+            <h1 id="page-title" class="hero">무엇이 궁금하세요?</h1>
+            <p id="conversation-status" class="notice" role="status" aria-live="polite" aria-atomic="true"></p>
             <section id="transcript" class="transcript" aria-label="대화 내용, 시간 순서"></section>
-            <dl id="run-summary" data-ux="UX-STATUS-ANNOUNCER" hidden>
-              <div><dt>실행 상태</dt><dd data-run-state></dd></div>
-              <div><dt>단계</dt><dd data-run-stage></dd></div>
-              <div><dt>갱신 시각</dt><dd data-run-updated></dd></div>
-            </dl>
+            <!-- UX-STATUS-ANNOUNCER is the "thinking" line: app.js moves it into the
+                 answer it describes, above the answer text. Collapsed it names the
+                 current step (or, settled, how many Wiki steps ran); expanded it lists
+                 the steps with the Run state, stage and last-update time. -->
+            <div id="run-summary" class="think-block" data-ux="UX-STATUS-ANNOUNCER" hidden>
+              <button type="button" class="think" data-think aria-expanded="false" aria-controls="run-detail"><span data-think-label></span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4l4 4-4 4"/></svg></button>
+              <div id="run-detail" class="think-detail" hidden>
+                <ol class="agent-steps" data-agent-steps aria-label="에이전트 진행 단계"></ol>
+                <!-- Run state and stage are text for a screen reader; on screen the
+                     list carries one quiet caption, "<time> 갱신". -->
+                <dl class="run-meta">
+                  <div class="visually-hidden"><dt>실행 상태</dt><dd data-run-state></dd></div>
+                  <div class="visually-hidden"><dt>단계</dt><dd data-run-stage></dd></div>
+                  <div><dt class="visually-hidden">갱신 시각</dt><dd data-run-updated></dd></div>
+                </dl>
+              </div>
+            </div>
             <p id="context-notice" class="notice" role="status" aria-live="polite" aria-atomic="true" hidden>
               대화가 길어져 오래된 대화 일부를 제외했어요.
             </p>
-            <div data-ux="UX-COMPOSER">
-              <label for="prompt">질문</label>
-              <textarea id="prompt" rows="3" disabled placeholder="질문을 입력해 주세요." aria-describedby="composer-help composer-reason"></textarea>
-              <div class="composer-actions">
-                <button id="send-question" class="secondary" type="button" aria-describedby="composer-reason" disabled>질문 보내기</button>
-                <button id="stop-run" type="button" data-ux="UX-STOP-ACTION" data-stop-action hidden disabled>생성 중지</button>
-              </div>
-            </div>
-            <p id="composer-help" class="notice" role="note">
-              Enter로 전송하고 Shift+Enter로 줄을 바꿉니다. 답변 생성 중에는 다음 질문을 보낼 수 없습니다.
-              생성 중에는 «생성 중지» 버튼으로 답변을 중단할 수 있습니다.
-            </p>
-            <p id="composer-reason" class="notice" data-composer-reason role="status" aria-live="polite" aria-atomic="true"></p>
-            <div id="run-recovery" class="notice" data-ux="UX-RUN-RECOVERY" data-run-recovery hidden>
+            <div id="run-recovery" class="recovery" data-ux="UX-RUN-RECOVERY" data-run-recovery hidden>
               <p data-recovery-message></p>
               <dl class="recovery-detail">
                 <div><dt>상태</dt><dd data-recovery-state></dd></div>
@@ -73,29 +87,34 @@
               </dl>
               <p class="recovery-reason" id="retry-reason" data-retry-reason></p>
               <div class="recovery-actions">
-                <button class="secondary" type="button" data-retry-run aria-describedby="retry-reason">재시도</button>
-                <button class="secondary" type="button" data-new-conversation>새 대화</button>
+                <button class="pill-btn" type="button" data-retry-run aria-describedby="retry-reason">재시도</button>
+                <button class="pill-btn" type="button" data-new-conversation>새 대화</button>
               </div>
             </div>
-            <p id="run-announcer" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+            <!-- One pill: the textarea and send/stop share it. The first question
+                 creates the conversation, so the composer is live as soon as the
+                 policy is. Send and stop are the same circle; one is shown at a time. -->
+            <div class="composer" data-ux="UX-COMPOSER">
+              <div class="pill" data-pill>
+                <label class="visually-hidden" for="prompt">질문</label>
+                <textarea id="prompt" rows="1" disabled placeholder="llm-wiki에 물어보세요" aria-describedby="composer-help composer-reason"></textarea>
+                <button id="send-question" class="send" type="button" aria-describedby="composer-reason" disabled><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 15.5v-11M5.5 9L10 4.5 14.5 9"/></svg><span class="visually-hidden">질문 보내기</span></button>
+                <button id="stop-run" class="send" type="button" data-ux="UX-STOP-ACTION" data-stop-action hidden disabled><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6" y="6" width="8" height="8" rx="1.5" fill="currentColor"/></svg><span class="visually-hidden">생성 중지</span></button>
+              </div>
+              <p id="composer-help" class="visually-hidden" role="note">Enter로 전송하고 Shift+Enter로 줄을 바꿉니다. 답변 생성 중에는 다음 질문을 보낼 수 없습니다. 생성 중에는 «생성 중지» 버튼으로 답변을 중단할 수 있습니다.</p>
+              <p id="composer-reason" class="composer-reason" data-composer-reason role="status" aria-live="polite" aria-atomic="true"></p>
+            </div>
             <span id="completed-answer" class="skip-target" tabindex="0" role="note"><span class="visually-hidden">완료 또는 실패한 실행 결과</span></span>
           </section>
 
           <section id="policy-panel" class="policy-panel" tabindex="-1" aria-labelledby="policy-title">
             <h2 id="policy-title">정보·정책</h2>
-            <p id="policy-status" class="policy-status" data-policy-status role="status" aria-live="polite" aria-atomic="true">
-              서비스 준비 상태와 정책을 확인하는 중입니다.
-            </p>
-            <p id="policy-impact" class="notice" data-policy-impact>
-              정책을 확인하는 동안 질문 기능을 사용할 수 없습니다.
-            </p>
-            <button class="secondary" type="button" data-policy-retry hidden>다시 확인</button>
             <noscript>
-              <p class="notice warning">JavaScript를 사용할 수 없어 서비스 준비 상태와 정책을 확인할 수 없습니다. 질문 기능은 사용할 수 없습니다.</p>
+              <p class="notice">JavaScript를 사용할 수 없어 서비스 준비 상태와 정책을 확인할 수 없습니다. 질문 기능은 사용할 수 없습니다.</p>
             </noscript>
 
             <div data-policy-success hidden>
-              <p class="notice warning">
+              <p class="notice">
                 개인정보, 회사 기밀, 비밀번호와 API 키(Credential)를 입력하지 마세요. 공개하거나 합성한 내용만 사용합니다.
               </p>
               <p class="notice">세션은 생성 시점부터 1시간이며 영구 저장되지 않습니다.</p>
@@ -106,38 +125,48 @@
                   <dl class="policy-list">
                     <div><dt>정책 schema</dt><dd data-policy-field="schema_version"></dd></div>
                     <div><dt>Provider</dt><dd data-policy-field="provider_label"></dd></div>
-                    <div><dt>Endpoint</dt><dd data-policy-field="endpoint_disclosure"></dd></div>
                     <div><dt>Model revision</dt><dd data-policy-field="model_revision"></dd></div>
-                    <div><dt>처리 지역</dt><dd data-policy-field="processing_region"></dd></div>
-                    <div><dt>Subprocessors</dt><dd data-policy-field="subprocessors"></dd></div>
                   </dl>
                 </section>
                 <section class="policy-card" aria-labelledby="transfer-title">
                   <h3 id="transfer-title">Provider 전송 범위</h3>
                   <dl class="policy-list">
                     <div><dt>전송 필드</dt><dd data-policy-field="transmitted_fields"></dd></div>
-                    <div><dt>보존</dt><dd data-policy-field="retention_summary"></dd></div>
-                    <div><dt>삭제</dt><dd data-policy-field="deletion_summary"></dd></div>
-                    <div><dt>학습 사용</dt><dd data-policy-field="training_use"></dd></div>
                   </dl>
                 </section>
                 <section class="policy-card" aria-labelledby="session-title">
                   <h3 id="session-title">세션과 지식 경계</h3>
                   <dl class="policy-list">
                     <div><dt>세션 TTL</dt><dd data-policy-field="session_ttl_seconds"></dd></div>
-                    <div><dt>Retrieval</dt><dd data-policy-field="retrieval_status"></dd></div>
-                    <div><dt>입력 금지 범주</dt><dd data-policy-field="input_warning_categories"></dd></div>
+                    <div><dt>지식 출처</dt><dd data-policy-field="retrieval_status"></dd></div>
+                    <div><dt>연결된 Wiki</dt><dd data-policy-field="wiki_display_name"></dd></div>
                   </dl>
                   <p data-ux="UX-KNOWLEDGE-NOTICE">
-                    답변은 일반 모델에서 생성되며 사내 지식, Knowledge Graph, Vector Search, RAG, Citation에 연결되지 않습니다. 중요한 내용은 별도로 확인해 주세요.
+                    답변은 연결된 Wiki에서 에이전트가 읽은 문서만 근거로 해요. 읽은 Wiki 발췌는 질문과 함께 위 Provider로 전송돼요. Wiki에 근거가 없으면 답하지 않고 Wiki 보충 대상인지 알려 드려요.
                   </p>
                 </section>
               </div>
             </div>
+            <p class="notice policy-pending">서비스 준비 상태를 확인하면 여기에 정책이 표시됩니다.</p>
           </section>
+          <!-- Outside both screens, so a run that settles while 정보·정책 is open is still announced. -->
+          <p id="run-announcer" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
         </main>
       </div>
     </div>
+    <template id="source-list-template">
+      <section class="sources" data-ux="UX-SOURCE-LIST" tabindex="0" aria-label="근거 문서" hidden>
+        <h3 class="visually-hidden">근거 문서</h3>
+        <ul></ul>
+      </section>
+    </template>
+    <!-- Icons app.js clones (it never parses markup). -->
+    <template id="icons">
+      <svg data-icon="copy" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="7" y="7" width="9.5" height="9.5" rx="2"/><path d="M13 7V5.5a2 2 0 0 0-2-2H5.5a2 2 0 0 0-2 2V11a2 2 0 0 0 2 2H7"/></svg>
+      <svg data-icon="check" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></svg>
+      <svg data-icon="info" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 7.2v4M8 5v.1" stroke-linecap="round"/></svg>
+    </template>
+    <script src="/static/markdown.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
+agent/node_modules/
 .tmp-ux-validation/
 .working/
 _bmad/config.user.toml
@@ -28,6 +29,12 @@ _bmad/core/config.yaml
 # Provider credentials -- values never committed
 .env
 
+# Fetched tokenizer.json (scripts/fetch_tokenizer.py) -- never committed
+.cache/
+
+# Local-only fixtures with real Wiki document paths -- never committed
+local/
+
 # Agent tooling and planning artifacts: regenerated per machine, not part of the shipped app
 .claude/
 .agents/
@@ -35,4 +42,9 @@ _bmad/
 _bmad-output/
 plan.md
 mvp.md
-tests/
+.superpowers/
+.mcp.json
+opencode.jsonc
+
+# Editor settings
+.vscode/

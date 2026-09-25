@@ -22,7 +22,7 @@ data: {"schema_version":"1","type":"message.delta","run_id":"…","sequence":3,"
 
 - `id:` -- Base-10 Sequence. 1부터 이 Run 안에서 빈틈없이 증가한다. Client가
   재연결할 때 `Last-Event-ID`로 그대로 돌려보내는 값이다.
-- `event:` -- 아래 8개 Type 중 하나. `data`의 `type`과 항상 같다.
+- `event:` -- 아래 10개 Type 중 하나. `data`의 `type`과 항상 같다.
 - `data:` -- `RunEventV1` compact JSON(UTF-8, `ensure_ascii=False`). 모든 Event가
   `schema_version`·`type`·`run_id`·`sequence`·`occurred_at`을 갖는다.
 
@@ -38,7 +38,9 @@ Server의 `RunEventV1` Union, Client의 `EVENT_TYPES` 배열, 그리고 이 표�
 | Type | 언제 | 고유 Field |
 |------|------|-----------|
 | `run.status` | Run이 `running`으로 시작할 때(Sequence 1), 그리고 Terminal에서 한 번 더 | `state`, `stage` |
+| `agent.step` | Agent가 한 단계를 시작할 때(Wiki 목록·검색·문서 읽기·근거 판단·답변 작성) | `step`(`AgentStepV1`) |
 | `message.delta` | 부분 출력 한 조각 | `message_id`, `text` |
+| `message.sources` | 완결 답변 바로 앞, 근거 문서와 결과 분류 | `message_id`, `outcome`, `sources`, `search_truncated`, `uncovered` |
 | `message.completed` | 답변이 완결로 Commit됐을 때 | `message_id`, `text` |
 | `message.discarded` | 실패·Timeout·Cancel로 부분 출력을 버릴 때 | `message_id` |
 | `run.error` | 실패 또는 Timeout의 Typed Failure | `error` |
@@ -46,7 +48,8 @@ Server의 `RunEventV1` Union, Client의 `EVENT_TYPES` 배열, 그리고 이 표�
 | `conversation.expired` | Stream이 열려 있는 동안 Conversation이 만료됐을 때 | -- |
 | `stream.end` | 이 Stream의 마지막 Event | `final_state`, `final_sequence` |
 
-`message.completed`는 **완결된 답변에만** 나온다. 부분 출력은 어떤 경로에서도
+`message.sources`는 언제나 `message.completed` 바로 앞에 한 번 나오며(AD-29), 부분
+출력만 남기고 끝난 Run에는 나오지 않는다. `message.completed`는 **완결된 답변에만** 나온다. 부분 출력은 어떤 경로에서도
 `completed`로 표시되지 않고 `message.discarded`로 버려진다.
 
 ## 순서
@@ -54,7 +57,7 @@ Server의 `RunEventV1` Union, Client의 `EVENT_TYPES` 배열, 그리고 이 표�
 성공:
 
 ```
-run.status(running) → (context.truncated?) → message.delta* → message.completed → run.status(completed) → stream.end
+run.status(running) → (context.truncated?) → (agent.step | message.delta)* → message.sources → message.completed → run.status(completed) → stream.end
 ```
 
 실패·Timeout:
@@ -70,7 +73,9 @@ run.status(running) → message.delta* → message.discarded → run.status(canc
 ```
 
 `run.status(running)`은 언제나 Sequence 1이다. `context.truncated`는 그 바로 뒤,
-첫 `message.delta` 앞에서 Run당 최대 한 번만 나온다.
+첫 `agent.step`·`message.delta` 앞에서 Run당 최대 한 번만 나온다. `agent.step`은
+실패·Timeout·Cancel 순서에서도 `message.discarded` 앞에 `message.delta`와 섞여 나올 수
+있다.
 `stream.end`의 `final_sequence`는 언제나 자기 자신의 `sequence`와 같다.
 
 네 순서(성공·실패/Timeout·Cancel·만료) 모두 문서에 적힌 그대로를 실제 Run이 낸 Event
@@ -158,16 +163,20 @@ event: message.delta
 data: {"schema_version":"1","type":"message.delta","run_id":"3f1d…","sequence":2,"occurred_at":"2026-08-30T05:00:00.4Z","message_id":"9a2c…","text":"안녕"}
 
 id: 3
-event: message.completed
-data: {"schema_version":"1","type":"message.completed","run_id":"3f1d…","sequence":3,"occurred_at":"2026-08-30T05:00:01Z","message_id":"9a2c…","text":"안녕하세요"}
+event: message.sources
+data: {"schema_version":"1","type":"message.sources","run_id":"3f1d…","sequence":3,"occurred_at":"2026-08-30T05:00:01Z","message_id":"9a2c…","outcome":"grounded","sources":[{"path":"concepts/example.md","title":"예시 문서","confidence":null,"contested":false}],"search_truncated":false,"uncovered":null}
 
 id: 4
-event: run.status
-data: {"schema_version":"1","type":"run.status","run_id":"3f1d…","sequence":4,"occurred_at":"2026-08-30T05:00:01Z","state":"completed","stage":"terminal"}
+event: message.completed
+data: {"schema_version":"1","type":"message.completed","run_id":"3f1d…","sequence":4,"occurred_at":"2026-08-30T05:00:01Z","message_id":"9a2c…","text":"안녕하세요"}
 
 id: 5
+event: run.status
+data: {"schema_version":"1","type":"run.status","run_id":"3f1d…","sequence":5,"occurred_at":"2026-08-30T05:00:01Z","state":"completed","stage":"terminal"}
+
+id: 6
 event: stream.end
-data: {"schema_version":"1","type":"stream.end","run_id":"3f1d…","sequence":5,"occurred_at":"2026-08-30T05:00:01Z","final_state":"completed","final_sequence":5}
+data: {"schema_version":"1","type":"stream.end","run_id":"3f1d…","sequence":6,"occurred_at":"2026-08-30T05:00:01Z","final_state":"completed","final_sequence":6}
 
 ```
 

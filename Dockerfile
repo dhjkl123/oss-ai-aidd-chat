@@ -1,6 +1,6 @@
-# One Image, for local Docker and for the Hugging Face Space alike. If the two ever
-# diverge, "the same app reproduced in both places" stops being a claim anyone can
-# check -- so the difference lives in the Manifest and the environment, never here.
+# The Image for running Cite under local Docker. Everything that differs between
+# machines (endpoint, key, Wiki, tokenizer) comes in through the environment and
+# Volumes at `docker run` time, never through this file.
 #
 # Three versions are pinned in this repo and all three are asserted below, because a
 # Base Image that drifts from them builds an app nobody tested:
@@ -11,6 +11,17 @@
 # Both bases are pinned BY DIGEST, not by tag: a tag can be re-pointed at a new
 # build, and the version asserts below would then pass against an image nobody
 # reviewed. Build with `--pull` to make the digest the thing that is fetched.
+#
+# The pi sidecar's own stage, built first: `npm ci` needs Node before this repo's
+# Python base has it, and building it separately keeps the sidecar's node_modules
+# out of the final Image's layers -- only the pruned /agent tree and the node
+# binary itself cross over, via the COPY --from below.
+FROM node:22.19.0-bookworm-slim@sha256:4a4884e8a44826194dff92ba316264f392056cbe243dcc9fd3551e71cea02b90 AS agent
+WORKDIR /agent
+COPY agent/package.json agent/package-lock.json ./
+RUN npm ci --omit=dev
+COPY agent/*.mjs ./
+
 FROM python:3.12.14-slim-bookworm@sha256:0f5b26b9518d002b6173fd61daad821fa340635ebfec5bba471013f9ca114579
 
 # UID 1000 first, before anything is written into /app: creating the user afterwards
@@ -53,19 +64,24 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY --chown=1000:1000 src ./src
 RUN uv sync --locked --no-dev
 
-# Hugging Face Docker Spaces route to this port; local Docker publishes it as-is.
+# The sidecar the wiki agent spawns as a child process (AGENT_SCRIPT resolves to
+# /app/agent/sidecar.mjs). Node itself has to come along too -- the final stage's
+# base is the Python Image, which has no node on PATH.
+COPY --from=agent /usr/local/bin/node /usr/local/bin/node
+COPY --from=agent --chown=1000:1000 /agent /app/agent
+
+# The app listens here; `docker run -p <host>:7860` publishes it.
 EXPOSE 7860
 
 # One worker, one process, one replica -- every ceiling this app enforces is
-# in-memory, so a second worker silently halves all of them. `deploy/huggingface/
-# README.md` and `.env.example` declare the same 1/1, and a test holds the three
-# together. Not a shell form: PID 1 must be uvicorn itself so a platform's SIGTERM
-# reaches it and lifespan shutdown runs.
+# in-memory, so a second worker silently halves all of them. Not a shell form:
+# PID 1 must be uvicorn itself so a platform's SIGTERM reaches it and lifespan
+# shutdown runs.
 #
 # `--proxy-headers` is uvicorn's default, spelled out because this app DEPENDS on it:
 # behind a TLS-terminating router the request scheme is https and the Origin gate
 # compares scheme://netloc exactly, so without X-Forwarded-Proto every mutating POST
 # answers 403. It only takes effect for peers named by FORWARDED_ALLOW_IPS, which is
-# unset here on purpose -- a public deployment sets it (and TRUSTED_PROXY_HOPS) for
-# its own router; see deploy/huggingface/README.md.
+# unset here on purpose -- a real deployment behind such a router sets it (and
+# TRUSTED_PROXY_HOPS) for its own router.
 CMD ["python", "-m", "uvicorn", "aidd_chat.main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1", "--proxy-headers"]

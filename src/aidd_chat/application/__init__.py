@@ -1,6 +1,7 @@
 from collections.abc import Callable, Mapping
 import asyncio
-from contextlib import suppress
+import concurrent.futures
+from contextlib import AbstractAsyncContextManager, suppress
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -8,11 +9,11 @@ from hashlib import sha256
 import json
 import logging
 from secrets import token_urlsafe
-from threading import Event, Lock, Thread, Timer
+from threading import Event, Lock, Thread
 import re
 import time
 import unicodedata
-from typing import Literal, Protocol, get_args, runtime_checkable
+from typing import Literal, Protocol, get_args
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_validator
@@ -29,8 +30,12 @@ from aidd_chat.domain import (
     UNCONFIGURED_LIMITS,
 )
 from aidd_chat.contracts import (
+    AgentProbeV1,
+    AgentResultV1,
+    AgentStepV1,
     CancelResultV1,
     ContextIntegrityError,
+    FIXED_REPLIES,
     RunStage,
     PreparedMessageV1,
     PreparedModelRequestV1,
@@ -55,8 +60,6 @@ RUN_DEADLINE = timedelta(seconds=RUN_DEADLINE_SECONDS)
 PROBE_TIMEOUT_SECONDS = 2
 READINESS_CACHE_SECONDS = 30.0
 MAX_POLICY_TEXT_LENGTH = 256
-MAX_SUBPROCESSOR_COUNT = 32
-MAX_SUBPROCESSOR_LABEL_LENGTH = 128
 # System + Current + History + role separators + special tokens, output reservation
 # excluded -- the single budget the Tokenizer Authority counts against (see Design Notes).
 CONTEXT_TOKEN_BUDGET = 8_192
@@ -134,27 +137,17 @@ TRANSMITTED_FIELDS = (
     "system_instruction",
     "current_message",
     "selected_prior_messages",
-)
-INPUT_WARNING_CATEGORIES = (
-    "personal_information",
-    "company_confidential_data",
-    "credentials",
+    "wiki_excerpts",
 )
 _POLICY_FIELDS = frozenset(
     {
         "schema_version",
         "provider_label",
-        "endpoint_disclosure",
         "model_revision",
         "transmitted_fields",
-        "retention_summary",
-        "deletion_summary",
-        "training_use",
-        "processing_region",
-        "subprocessors",
         "session_ttl_seconds",
         "retrieval_status",
-        "input_warning_categories",
+        "wiki_display_name",
     }
 )
 _UNKNOWN_METADATA = re.compile(
@@ -165,7 +158,6 @@ _UNSAFE_METADATA = re.compile(
     r"(?:secret|credential|password|token|api[_ -]?key|authorization|bearer|private[_ -]?(?:endpoint|route|network|host|routing)|internal[_ -]?(?:endpoint|route|network|host|routing)|query(?:[_ -]?string)?|trace|raw[_ -]?response|stack[_ -]?trace|debug|response[_ -]?(?:body|headers?)|chain[_ -]?of[_ -]?thought|intermediate|cookie|jwt|oauth|https?://|[?&])",
     re.IGNORECASE,
 )
-_OPAQUE_ENDPOINT = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _PROVIDER_FAILURES = {
     "provider_auth": (False, "Provider 인증을 확인해 주세요."),
     "provider_rate_limit": (True, "요청이 많아요. 잠시 후 다시 시도해 주세요."),
@@ -182,6 +174,8 @@ _PROVIDER_FAILURES = {
     "provider_content_filtered": (False, "Provider 정책으로 답변을 표시할 수 없어요. 새 대화에서 다시 시도해 주세요."),
     "provider_unknown": (False, "Provider 오류가 발생했어요. 새 대화를 시작해 주세요."),
     "capacity_exceeded": (False, "답변이 이 대화에 허용된 크기를 넘어 저장하지 못했어요. 새 대화를 시작해 주세요."),
+    "agent_runtime_unavailable": (True, "답변 엔진을 다시 시작하고 있어요. 잠시 후 다시 시도해 주세요."),
+    "wiki_unavailable": (False, "Wiki를 읽을 수 없어요. Wiki 경로 설정을 확인해 주세요."),
 }
 
 
@@ -212,6 +206,14 @@ READINESS_CODES = frozenset({
     "tokenizer_authority_invalid",
     "cancellation_unsupported",
     "provider_probe_failed",
+    # The async-probe outcomes `_run_probe` can distinguish, split out of the
+    # `provider_probe_failed` catch-all below so an operator's log tells "the
+    # 2 s budget expired while a Probe was still in flight" apart from "the
+    # Probe answered and named a Provider, Wiki or Context failure".
+    "probe_timeout",
+    "digest_mismatch",
+    "wiki_probe_failed",
+    "context_probe_failed",
 })
 TELEMETRY_ERROR_CLASSES = (
     frozenset(_PROVIDER_FAILURES)
@@ -335,26 +337,30 @@ def _provider_satisfies_context_budget(provider: object) -> bool:
 
 
 def _provider_supports_cancellation(provider: object) -> bool:
-    """Cancel/Close Gate: a Provider that hands out no cancel handle, does not
-    confirm it closes its stream, or declares no usable close budget cannot honour a
-    stop request -- so it fails readiness closed and questions are refused rather
-    than becoming unstoppable. Zero is not a budget: `wait_for(close(), 0)` cancels
-    the close before it can start and strands the Provider's response generators."""
+    """Cancel Gate: an agent that cannot be aborted, or declares no close budget,
+    cannot honour a stop request -- so it fails readiness closed and questions are
+    refused rather than becoming unstoppable. Zero is not a budget: a Grace of 0
+    cancels the close before it can start and strands the agent's run."""
     grace = getattr(provider, "close_grace_ms", None)
-    if not (
-        isinstance(provider, CancellableModelProviderPort)
-        and isinstance(grace, int)
+    return (
+        isinstance(grace, int)
         and not isinstance(grace, bool)
         and grace > 0
-    ):
-        return False
+        and callable(getattr(provider, "abort", None))
+        and callable(getattr(provider, "run", None))
+    )
+
+
+def _close_grace_seconds(provider: object) -> float:
+    """The Close Grace in seconds, or 0 for a provider that declares nothing usable
+    -- a stuck task is then cancelled at once rather than never."""
     try:
-        return provider.closes_stream() is True
+        return max(0.0, float(provider.close_grace_ms) / 1_000)
     except Exception:
-        return False
+        return 0.0
 
 
-def _effective_budget(provider: "ModelProviderPort") -> int:
+def _effective_budget(provider: "AgentRuntimePort") -> int:
     """The budget is exactly CONTEXT_TOKEN_BUDGET (spec) even if a bound Provider
     advertises a larger window -- never smaller, via the Counter/limit Gate above."""
     return min(provider.max_input_tokens, CONTEXT_TOKEN_BUDGET)
@@ -390,78 +396,36 @@ class PolicyProjectionV1(BaseModel):
 
     schema_version: Literal["1"]
     provider_label: StrictStr
-    endpoint_disclosure: StrictStr
     model_revision: StrictStr
     transmitted_fields: tuple[
-        Literal["system_instruction", "current_message", "selected_prior_messages"],
+        Literal["system_instruction", "current_message", "selected_prior_messages", "wiki_excerpts"],
         ...,
     ]
-    retention_summary: StrictStr
-    deletion_summary: StrictStr
-    training_use: Literal["not_used", "provider_policy"]
-    processing_region: StrictStr
-    subprocessors: tuple[StrictStr, ...]
     session_ttl_seconds: Literal[3_600]
-    retrieval_status: Literal["disabled"]
-    input_warning_categories: tuple[
-        Literal["personal_information", "company_confidential_data", "credentials"],
-        ...,
-    ]
+    retrieval_status: Literal["wiki_readonly"]
+    wiki_display_name: StrictStr
 
-    @field_validator(
-        "provider_label",
-        "model_revision",
-        "retention_summary",
-        "deletion_summary",
-        "processing_region",
-        mode="before",
-    )
+    @field_validator("provider_label", "model_revision", mode="before")
     @classmethod
     def _validate_public_text(cls, value: object) -> object:
         if not _safe_public_text(value):
             raise ValueError("공개 정책 문자열은 비어 있지 않은 값이어야 합니다")
         return value
 
-    @field_validator("endpoint_disclosure", mode="before")
+    # A dedicated 128-char cap, not the shared 256-char one above: app.js's
+    # isExactPolicy checks safeRuntimeText(value.wiki_display_name, 128), and a
+    # Server value the browser then refuses would be a policy the UI cannot show.
+    @field_validator("wiki_display_name", mode="before")
     @classmethod
-    def _validate_endpoint(cls, value: object) -> object:
-        if not _safe_public_text(value, max_length=64) or not _OPAQUE_ENDPOINT.fullmatch(value):
-            raise ValueError("Endpoint는 opaque 공개 label이어야 합니다")
-        lowered = value.casefold()
-        if (
-            lowered in {"localhost", "127.0.0.1", "private", "internal"}
-            or any(word in lowered for word in ("localhost", "private", "internal"))
-            or lowered.endswith((".local", ".internal"))
-            or bool(re.fullmatch(r"\d+(?:\.\d+){3}", lowered))
-        ):
-            raise ValueError("Endpoint 공개 label이 미확정입니다")
+    def _validate_wiki_display_name(cls, value: object) -> object:
+        if not _safe_public_text(value, max_length=128):
+            raise ValueError("공개 정책 문자열은 비어 있지 않은 값이어야 합니다")
         return value
 
     @field_validator("transmitted_fields", mode="before")
     @classmethod
     def _canonical_transmitted_fields(cls, value: object) -> tuple[str, ...]:
         return _canonical_tuple(value, TRANSMITTED_FIELDS, "전송 필드")
-
-    @field_validator("input_warning_categories", mode="before")
-    @classmethod
-    def _canonical_input_warning_categories(cls, value: object) -> tuple[str, ...]:
-        return _canonical_tuple(value, INPUT_WARNING_CATEGORIES, "입력 금지 범주")
-
-    @field_validator("subprocessors", mode="before")
-    @classmethod
-    def _canonical_subprocessors(cls, value: object) -> tuple[str, ...]:
-        if not isinstance(value, (list, tuple)) or len(value) > MAX_SUBPROCESSOR_COUNT:
-            raise ValueError("Subprocessor는 label tuple이어야 합니다")
-        return tuple(value)
-
-    @field_validator("subprocessors")
-    @classmethod
-    def _validate_subprocessors(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not _safe_public_text(item, max_length=MAX_SUBPROCESSOR_LABEL_LENGTH) for item in value):
-            raise ValueError("Subprocessor label이 비어 있거나 안전하지 않습니다")
-        if len(set(value)) != len(value):
-            raise ValueError("Subprocessor label은 중복될 수 없습니다")
-        return value
 
 
 def _canonical_tuple(value: object, expected: tuple[str, ...], label: str) -> tuple[str, ...]:
@@ -481,17 +445,11 @@ def _canonical_tuple(value: object, expected: tuple[str, ...], label: str) -> tu
 class ProviderPolicyMetadata:
     schema_version: str
     provider_label: str
-    endpoint_disclosure: str
     model_revision: str
     transmitted_fields: tuple[str, ...]
-    retention_summary: str
-    deletion_summary: str
-    training_use: str
-    processing_region: str
-    subprocessors: tuple[str, ...]
     session_ttl_seconds: int
     retrieval_status: str
-    input_warning_categories: tuple[str, ...]
+    wiki_display_name: str
 
 
 def build_policy_projection(metadata: object) -> PolicyProjectionV1:
@@ -515,7 +473,7 @@ def build_policy_projection(metadata: object) -> PolicyProjectionV1:
 
 def _reject_unsafe_value(value: object) -> None:
     if isinstance(value, str):
-        if value in TRANSMITTED_FIELDS + INPUT_WARNING_CATEGORIES:
+        if value in TRANSMITTED_FIELDS:
             return
         if not _safe_public_text(value):
             raise ValueError("Provider 공개 정책에 비공개 detail이 포함되었습니다")
@@ -619,7 +577,16 @@ class ConversationStorePort(Protocol):
     ) -> bool: ...
 
     def commit_completed(
-        self, conversation_id: UUID, expected_active_run_id: UUID, content: str, now: datetime
+        self,
+        conversation_id: UUID,
+        expected_active_run_id: UUID,
+        content: str,
+        result: AgentResultV1,
+        now: datetime,
+    ) -> bool: ...
+
+    def commit_step(
+        self, conversation_id: UUID, expected_active_run_id: UUID, step: AgentStepV1, now: datetime
     ) -> bool: ...
 
     def commit_delta(
@@ -631,6 +598,7 @@ class ConversationStorePort(Protocol):
         conversation_id: UUID,
         expected_active_run_id: UUID,
         content: str,
+        result: AgentResultV1,
         mismatch_failure: ProviderFailureV1,
         now: datetime,
     ) -> bool: ...
@@ -739,19 +707,22 @@ class ConversationStorePort(Protocol):
     def close(self) -> None: ...
 
 
-class ModelProviderPort(Protocol):
-    def complete(self, request: PreparedModelRequestV1) -> str: ...
+class AgentRunError(Exception):
+    """The only exception an AgentRuntimePort raises out of run(). `kind` is a
+    ProviderFailureKind; the Application maps it through _PROVIDER_FAILURES."""
 
-    def probe(self) -> bool: ...
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
 
+
+class AgentRuntimePort(Protocol):
+    # metadata the ContextWindowPolicy and readiness already read (unchanged names)
     @property
     def policy_metadata(self) -> ProviderPolicyMetadata: ...
 
     @property
-    def tokenizer_authority(self) -> tuple[str, str, int]:
-        """(name, version, max_input_tokens). Only story 1.11's real Provider swap
-        needs to change; everything else is written against this Port."""
-        ...
+    def tokenizer_authority(self) -> tuple[str, str, int]: ...
 
     @property
     def max_input_tokens(self) -> int: ...
@@ -760,79 +731,69 @@ class ModelProviderPort(Protocol):
     def provider_profile_digest(self) -> str: ...
 
     @property
-    def binding_digest(self) -> str:
-        """SHA-256 of the ProviderBindingV1 snapshot, recorded on each Run."""
-        ...
-
-    def count_input_tokens(self, request: PreparedModelRequestV1) -> int: ...
-
-
-class SupportsCancel(Protocol):
-    """The only thing the Application ever asks of a Provider call handle."""
-
-    def cancel(self) -> None: ...
-
-
-@runtime_checkable
-class CancellableModelProviderPort(Protocol):
-    """Optional provider capability. `new_call_handle()` is called on the thread
-    that is about to make the Provider call and returns a one-shot handle whose
-    `cancel()` another thread may invoke; `closes_stream()` confirms the stream is
-    always closed, and `close_grace_ms` is the budget it gets. All three are
-    declared here because readiness enforces all three -- a Provider that satisfies
-    the Protocol and still fails the Gate would leave an operator with nothing to
-    look at."""
+    def binding_digest(self) -> str: ...
 
     @property
     def close_grace_ms(self) -> int: ...
 
-    def new_call_handle(self) -> SupportsCancel: ...
+    def count_input_tokens(self, request: PreparedModelRequestV1) -> int: ...
 
-    def closes_stream(self) -> bool:
-        """True only if every call this Provider makes closes its stream context
-        exactly once, within close_grace_ms."""
-        ...
+    async def start(self) -> None: ...  # spawn/connect; FakeAgent no-op
 
+    async def aclose(self) -> None: ...  # terminate; FakeAgent no-op
 
-@runtime_checkable
-class StreamingModelProviderPort(Protocol):
-    """Optional provider capability, probed with isinstance before the streaming
-    commit protocol is used. Declared separately from ModelProviderPort so a
-    provider that only implements complete() stays a valid provider."""
+    async def probe(self) -> AgentProbeV1: ...
 
-    def stream(
-        self, request: PreparedModelRequestV1, on_delta: Callable[[str], None]
-    ) -> str: ...
+    def run(
+        self,
+        run_id: UUID,
+        correlation_id: UUID,
+        prepared: PreparedModelRequestV1,
+        on_step: Callable[[AgentStepV1], None],
+        on_delta: Callable[[str], None],
+    ) -> AbstractAsyncContextManager[AgentResultV1]: ...
+
+    async def abort(self, run_id: UUID) -> None: ...  # idempotent; unknown run_id is a no-op
 
 
 @dataclass(frozen=True)
 class _BootstrapBinding:
-    provider: ModelProviderPort
+    provider: AgentRuntimePort
     projection: PolicyProjectionV1 | None
 
 
 @dataclass
 class _Generation:
-    """One in-flight generation: the worker thread, plus the Provider call handle
-    it published so `cancel_run` -- running on a request thread -- can reach it."""
+    """One in-flight generation: the asyncio Task running `_generate` on the agent
+    loop, reached from request threads and the Sweeper through its Future."""
 
     conversation_id: UUID
-    thread: Thread
     # The Run's Correlation ID -- the value ChatApplication minted at acceptance and
-    # the Domain already holds, cached here, never minted here. Read on exactly one
-    # path: a Provider cancel that fails after the Conversation was Purged, where
-    # there is no Run left to read it from.
+    # the Domain already holds, cached here, never minted here. Read on two paths:
+    # the call into `provider.run`, and a Provider abort that fails after the
+    # Conversation was Purged, where there is no Run left to read it from.
     correlation_id: UUID
-    handle: "SupportsCancel | None" = None
+    # Set in the same `_generation_lock` section that registers this entry, so
+    # every registered generation has one: what the waiters block on.
+    future: "concurrent.futures.Future | None" = None
+    # The asyncio Task itself, recorded by `_generate` on its first step -- the
+    # Future above is only its cross-thread shadow and cannot cancel a running
+    # Task. What the close-grace watchdog and `shutdown` cancel when an agent
+    # ignores its abort.
+    task: "asyncio.Task | None" = None
+    # Set, under `_generation_lock`, by the first stop request: however many
+    # callers ask, the runtime is sent exactly one `abort` per Run.
+    abort_requested: bool = False
     # Set once this Run has been cancelled: its terminal state is already
     # committed, so the next question must wait for the task itself to end.
     cancelled: bool = False
     # Set when that cancellation was the Deadline, not the user. Whatever the
     # Provider raises on the way out, this Run's terminal is `timeout`.
     timed_out: bool = False
-    # The Deadline alarms for this Run, armed by the task itself. This is what
-    # makes the Deadline hold with no client attached.
-    timers: list["Timer"] = field(default_factory=list)
+    # The Deadline alarm for this Run, armed on the agent loop by the task itself.
+    # This is what makes the Deadline hold with no client attached. A list because
+    # the alarm re-arms itself when asyncio runs it a clock tick early.
+    timers: list["asyncio.TimerHandle"] = field(default_factory=list)
 
 
 @dataclass
@@ -847,6 +808,12 @@ class _ProbeFlight:
     deadline: float
     event: Event
     result: bool = False
+    # Set by `_run_probe` right beside `result`, under the same lock, so the two
+    # never disagree about the same flight -- the specific Readiness Code a
+    # failed `result` should log, or None when `result` is True (health is not
+    # an Error Class) or the failure is a stale-binding race `_probe_readiness`
+    # already has its own generic fallback for.
+    reason: str | None = None
 
 
 # Omitting `limits` means an in-process unit test never had a deployment; passing
@@ -854,6 +821,40 @@ class _ProbeFlight:
 # readiness, so the two cannot be the same value -- and a frozen DeploymentLimits
 # is a real one, unlike a bare sentinel object.
 _UNCONFIGURED = DeploymentLimits()
+
+
+class _AgentLoop:
+    """The one event loop every AgentRuntimePort call, deadline alarm and sidecar
+    child lives on. Owned by ChatApplication on a daemon thread because every caller
+    it serves is synchronous -- sync route handlers, the store's sweeper thread and
+    the story tests -- and `run_coroutine_threadsafe` is the one bridge they share."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self._thread = Thread(target=self.loop.run_forever, daemon=True, name="aidd-agent-loop")
+        self._thread.start()
+
+    def submit(self, coro) -> "concurrent.futures.Future":
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def close(self) -> None:
+        if self.loop.is_closed():
+            return
+
+        async def cancel_pending() -> None:
+            # Anything still pending when the loop stops would be destroyed pending,
+            # with a warning per Task -- cancel it and let it unwind first.
+            tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        with suppress(Exception):
+            self.submit(cancel_pending()).result(timeout=2)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(5)
+        if not self.loop.is_running():
+            self.loop.close()
 
 
 class ChatApplication:
@@ -868,7 +869,7 @@ class ChatApplication:
     def __init__(
         self,
         store: ConversationStorePort,
-        provider: ModelProviderPort,
+        provider: AgentRuntimePort,
         max_attempts_per_lineage: int,
         limits: DeploymentLimits | None = _UNCONFIGURED,
     ) -> None:
@@ -886,9 +887,18 @@ class ChatApplication:
         # Bootstrap always passes the argument.
         self._limits = limits
         self.store = store
+        self.agent_loop = _AgentLoop()
         store.apply_limits(self.limits)
         self._readiness_lock = Lock()
         self._provider_binding = provider
+        start = getattr(provider, "start", None)
+        if callable(start):
+            try:
+                self.agent_loop.submit(start()).result(timeout=15)
+            except Exception as exc:
+                # Readiness answers for it: a binding whose child never started fails
+                # the probe. Never fatal here -- /ready must be able to say 503.
+                _log.error("Agent runtime start failed (%s)", type(exc).__name__)
         self._policy_projection: PolicyProjectionV1 | None
         try:
             self._policy_projection = build_policy_projection(provider.policy_metadata)
@@ -929,7 +939,7 @@ class ChatApplication:
         store.set_purge_observer(self._observe_purge)
 
     @property
-    def provider(self) -> ModelProviderPort:
+    def provider(self) -> AgentRuntimePort:
         return self._provider_binding
 
     @property
@@ -1185,7 +1195,7 @@ class ChatApplication:
         target actually used?
 
         Two facts, because there are two records and they cover different ground.
-        The Run's `binding_digest` is the whole ProviderBindingV1 -- it moves when the
+        The Run's `binding_digest` is the whole AgentBindingV1 -- it moves when the
         endpoint moves, which the Profile Digest alone does not. The Snapshot's
         `provider_profile_digest` covers a target that reached the Provider without
         a Binding Digest ever being recorded. `None` is not a mismatch: a Run that
@@ -1238,29 +1248,29 @@ class ChatApplication:
         # Required, with no default: this is the ID the caller already minted and
         # handed to the Domain. A default here would be a second mint and a second
         # thing to get wrong.
-        task = Thread(
-            target=self._generate,
-            args=(
-                projection.conversation_id,
-                projection.run_id,
-                projection.input_message_id,
-                content,
-                deadline_monotonic,
-                snapshot,
-                lease,
-            ),
-            daemon=True,
-            name=f"aidd-generation-{projection.run_id}",
-        )
+        generation = _Generation(projection.conversation_id, correlation_id)
         try:
+            # Scheduled and registered in one critical section: every reader of
+            # `_generation_tasks` takes this lock, so no waiter can see the entry
+            # without its Future, and a Cancel arriving the instant the Run is
+            # accepted finds something to mark. `submit` only queues the Task (it
+            # never waits on the loop), and the Task's first step takes this lock
+            # too, so it cannot run -- or pop its own entry -- before it is stored.
             with self._generation_lock:
-                self._generation_tasks[projection.run_id] = _Generation(
-                    projection.conversation_id, task, correlation_id
+                generation.future = self.agent_loop.submit(
+                    self._generate(
+                        projection.conversation_id,
+                        projection.run_id,
+                        projection.input_message_id,
+                        content,
+                        deadline_monotonic,
+                        snapshot,
+                        lease,
+                    )
                 )
-                task.start()
+                self._generation_tasks[projection.run_id] = generation
         except Exception:
-            with self._generation_lock:
-                self._generation_tasks.pop(projection.run_id, None)
+            # Nothing was registered: `submit` raised before the entry was stored.
             if lease is not None:
                 # The task that would have released it never started.
                 self.store.release_run(lease)
@@ -1336,20 +1346,29 @@ class ChatApplication:
     def _commit_timeout(
         self, conversation_id: UUID, run_id: UUID, *, due_only: bool = False
     ) -> bool:
-        """Structured Cancellation first, `commit_timeout` to confirm it. Unlike
-        `cancel_run`, the reverse would be wrong here: the Provider must be told to
-        stop before the Deadline is recorded as met, and the `timed_out` flag set
-        with the cancel is what makes the generation task -- whose call is about to
-        raise *because* of it -- commit `timeout` rather than a Provider failure. A
-        late callback loses the CAS either way.
+        """AD-6's order, the same as `cancel_run`'s: the `timeout` terminal is
+        committed FIRST, and only a commit that won asks the runtime to stop -- one
+        abort, then the Close Grace (`_request_provider_cancel`). Every callback the
+        agent makes after the fence is refused by the store, so nothing it says on
+        its way out can reach the stream.
+
+        The `timed_out` flag is raised BEFORE the commit: the generation task may be
+        failing at this very moment, and the flag is what routes its `fail()` to
+        `timeout` instead of a Provider failure. A commit that lost puts the flag
+        back -- the Run reached a terminal of its own inside the window, and leaving
+        it set would re-route that Run's later `fail()` to a `timeout` it never had.
 
         `due_only` is asked first and separately, because a caller walking past an
-        arbitrary Run must not cancel one whose Deadline has not passed."""
+        arbitrary Run must not time out one whose Deadline has not passed."""
         if due_only and not self.store.run_past_deadline(
             conversation_id, run_id, time.monotonic()
         ):
             return False
-        self._request_provider_cancel(run_id, timed_out=True)
+        with self._generation_lock:
+            generation = self._generation_tasks.get(run_id)
+            was_timed_out = generation is not None and generation.timed_out
+            if generation is not None:
+                generation.timed_out = True
         committed = self.store.commit_timeout(
             conversation_id,
             run_id,
@@ -1358,14 +1377,10 @@ class ChatApplication:
         )
         if committed:
             self._run_telemetry(conversation_id, run_id)
-        if not committed:
-            # The Run reached a terminal of its own inside the cancel-then-commit
-            # window. Leaving `timed_out` set would re-route that Run's later
-            # `fail()` to a `timeout` it never had.
+            self._request_provider_cancel(run_id, timed_out=True)
+        elif generation is not None:
             with self._generation_lock:
-                generation = self._generation_tasks.get(run_id)
-                if generation is not None:
-                    generation.timed_out = False
+                generation.timed_out = was_timed_out
         return committed
 
     def cancel_run(self, run_id: UUID, capability: str) -> CancelResultV1:
@@ -1531,30 +1546,39 @@ class ChatApplication:
         self.record_telemetry(uuid4(), "queued", error_class=code)
 
     def _request_provider_cancel(self, run_id: UUID, timed_out: bool = False) -> None:
-        """Best-effort, and safe to enter concurrently: a poll, an SSE slice read,
-        `cancel_run` and the task's own Deadline alarm can all arrive at once, and
-        the Deadline path deliberately arrives *before* winning any CAS. Only the
-        one-shot `ProviderCallHandle` makes that harmless -- at most one cancellation
-        ever reaches the Provider however many callers ask. Nothing the Provider
+        """Stop a Run whose terminal is already fenced -- `cancel_run` and
+        `_commit_timeout` only call in here after their commit won, and the Store's
+        Sweeper only after its Purge. Re-entrant: those can all arrive at once, and
+        only the first request (`abort_requested`, under `_generation_lock`) sends
+        `abort`; later ones only update the flags. So the runtime sees exactly one
+        stop per Run.
+
+        On the loop, the stop is AD-25's: one `abort`, then the Close Grace. A Task
+        still running when the Grace is up has ignored its abort and is cancelled,
+        which is what guarantees a stuck agent releases its Run slot.
+
+        Thread-safe by construction: it only takes `_generation_lock` and hands the
+        work to the agent loop -- it never blocks on it, so request threads, the
+        Sweeper and the loop's own alarms can all call in here. Nothing the Provider
         raises afterwards may disturb the Run."""
         with self._generation_lock:
             generation = self._generation_tasks.get(run_id)
-            if generation is not None:
-                generation.cancelled = True
-                generation.timed_out = generation.timed_out or timed_out
-        handle = None if generation is None else generation.handle
-        if handle is None:
-            return
-        try:
-            handle.cancel()
-        except Exception:
+            if generation is None:
+                return
+            generation.cancelled = True
+            generation.timed_out = generation.timed_out or timed_out
+            if generation.abort_requested:
+                return
+            generation.abort_requested = True
+
+        def report_cancel_failed() -> None:
             # Swallowed on purpose -- a Provider that cannot be told to stop must not
             # take the caller down -- but no longer silent: this is the one signal
-            # that a Run is going to run to its Deadline rather than stop.
+            # that a Run is going to be cut off at its Grace rather than stop.
             #
-            # Suppressed in turn, because this replaced a bare `pass`: `cancel_run`
-            # and `_commit_timeout` both call in here and neither suppresses, so an
-            # observation that raised would turn a best-effort cancel into a 500.
+            # Suppressed in turn: `cancel_run` and `_commit_timeout` both call in here
+            # and neither suppresses, so an observation that raised would turn a
+            # best-effort cancel into a 500.
             with suppress(Exception):
                 self._run_telemetry(
                     generation.conversation_id,
@@ -1562,6 +1586,35 @@ class ChatApplication:
                     error_class="provider_cancel_failed",
                     fallback_correlation_id=generation.correlation_id,
                 )
+
+        provider = self.provider
+
+        async def stop() -> None:
+            # Armed before the abort is awaited: an abort that itself hangs must not
+            # hold the Grace open.
+            asyncio.get_running_loop().call_later(
+                _close_grace_seconds(provider), self._cancel_stuck_generation, run_id
+            )
+            try:
+                await provider.abort(run_id)
+            except Exception:
+                report_cancel_failed()
+
+        try:
+            self.agent_loop.submit(stop())
+        except Exception:
+            report_cancel_failed()
+
+    def _cancel_stuck_generation(self, run_id: UUID) -> None:
+        """The Close Grace is up (on the agent loop). A generation Task still running
+        now ignored its abort: cancel it. Its `except CancelledError` loses the
+        terminal CAS to the commit that fenced it, and its `finally` releases the
+        Run slot."""
+        with self._generation_lock:
+            generation = self._generation_tasks.get(run_id)
+            task = None if generation is None else generation.task
+        if task is not None and not task.done():
+            task.cancel()
 
     def _timed_out(self, run_id: UUID) -> bool:
         with self._generation_lock:
@@ -1584,36 +1637,36 @@ class ChatApplication:
         A Deadline expiry is deliberately not waited on. Its Provider call has
         already had the whole 120 s and been told to stop; a call that ignores its
         handle would otherwise wedge the Conversation for every later question and
-        Retry. ponytail: that thread still runs to completion -- bounding the thread
+        Retry. ponytail: that task still runs to completion -- bounding the task
         itself needs the Story 1.8 capacity contract."""
         deadline = time.monotonic() + timeout
         while True:
             with self._generation_lock:
-                threads = [
-                    item.thread
+                futures = [
+                    item.future
                     for item in self._generation_tasks.values()
                     if item.conversation_id == conversation_id
                     and item.cancelled
                     and not item.timed_out
                 ]
-            if not threads:
+            if not futures:
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            threads[0].join(remaining)
+            concurrent.futures.wait(futures[:1], remaining)
 
     def wait_for_generations(self, timeout: float | None = 2.0) -> None:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self._generation_lock:
-                tasks = tuple(item.thread for item in self._generation_tasks.values())
-            if not tasks:
+                futures = [item.future for item in self._generation_tasks.values()]
+            if not futures:
                 return
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return
-            tasks[0].join(remaining)
+            concurrent.futures.wait(futures[:1], remaining)
 
     def expired_stream_tail(
         self, run_id: UUID, capability: str, cursor: int
@@ -1650,7 +1703,27 @@ class ChatApplication:
         # The Sweeper first: it must not start a Purge -- and a Provider cancel --
         # while the generations it would disturb are being waited on.
         self.store.close()
-        self.wait_for_generations(None)
+        # Bounded: a Run fenced before this has its abort and Grace in flight, and
+        # every live Run has its Deadline alarm -- but an agent that ignores both
+        # must not hold the process open. What is left after the wait is cancelled
+        # on the loop, where each Task's own `finally` releases its Run slot.
+        self.wait_for_generations(_close_grace_seconds(self.provider) + 2)
+        with self._generation_lock:
+            stuck = [item.task for item in self._generation_tasks.values() if item.task is not None]
+        for task in stuck:
+            with suppress(Exception):
+                self.agent_loop.loop.call_soon_threadsafe(task.cancel)
+        if stuck:
+            self.wait_for_generations(1)
+        # Then the runtime (the sidecar child, once there is one), on the loop it
+        # lives on, and only then the loop itself.
+        # Not on a loop that is no longer running (a second `shutdown`): the
+        # `aclose()` coroutine would never be awaited.
+        aclose = getattr(self.provider, "aclose", None)
+        if callable(aclose) and self.agent_loop.loop.is_running():
+            with suppress(Exception):
+                self.agent_loop.submit(aclose()).result(timeout=5)
+        self.agent_loop.close()
 
     def _ensure_within_budget(self, current_content: str) -> None:
         """System+Current Gate: computed before accept_question, so an oversized
@@ -1681,7 +1754,7 @@ class ChatApplication:
         conversation_id: UUID,
         input_message_id: UUID,
         current_content: str,
-        provider: ModelProviderPort,
+        provider: AgentRuntimePort,
     ) -> tuple[PreparedModelRequestV1, int] | None:
         """Newest-first greedy budget fit: keep the longest contiguous run of the
         most recent completed Turns that fits, drop the rest -- always a whole,
@@ -1718,26 +1791,7 @@ class ChatApplication:
             raise ContextTooLarge
         return final_request, dropped_turn_count
 
-    def _publish_call_handle(self, run_id: UUID, provider: object) -> "SupportsCancel | None":
-        """Minted here, on the generation thread, because that is the thread that
-        will make the Provider call, and returned so the call itself can take it.
-        None means this Run cannot be stopped -- the Provider declares no
-        cancellability, or declares it and fails to deliver -- and the caller
-        refuses to start it either way. readiness makes that unreachable in
-        production; this is the boundary that makes it true regardless."""
-        if not isinstance(provider, CancellableModelProviderPort):
-            return None
-        try:
-            handle = provider.new_call_handle()
-        except Exception:
-            return None
-        with self._generation_lock:
-            generation = self._generation_tasks.get(run_id)
-            if generation is not None:
-                generation.handle = handle
-        return handle
-
-    def _generate(
+    async def _generate(
         self,
         conversation_id: UUID,
         run_id: UUID,
@@ -1747,56 +1801,52 @@ class ChatApplication:
         snapshot: tuple[PreparedModelRequestV1, int] | None = None,
         lease: RunLease | None = None,
     ) -> None:
-        # The Provider is stopped a Close Grace *before* the Deadline, so the stream
-        # close still lands inside the 120 s instead of claiming time of its own.
-        # A Grace longer than what is left leaves no room for the call either, and
-        # none is granted -- the Deadline is never extended to make one fit.
-        # close_grace_ms, not close_grace_seconds: the former is what the Port
-        # declares and what readiness validates. A provider that answers with
-        # something non-numeric gets no Grace rather than taking the thread down.
-        try:
-            grace_ms = float(self.provider.close_grace_ms)
-        except Exception:
-            grace_ms = 0.0
-        # Clamped, not subtracted: the Grace may only take what is left of the
-        # Deadline. With less than a Grace remaining the call still happens and is
-        # cancelled at once -- it is never refused to make room for a close.
-        cancel_at = max(time.monotonic(), deadline_monotonic - max(0.0, grace_ms) / 1_000)
+        # One Run = one asyncio Task on the agent loop. Every store call below is
+        # synchronous and holds the store's per-Conversation lock with no `await`
+        # inside it, which is AD-4's "or equivalent": the loop never yields while a
+        # critical section is open.
+        provider = self.provider
+        # Recorded first, so the Close Grace watchdog and `shutdown` can cancel this
+        # Task if the agent ignores its abort. The entry is registered in the same
+        # lock section that scheduled this Task, so this lookup waits until it is
+        # stored; it is only missing when `_generate` is driven directly.
+        with self._generation_lock:
+            generation = self._generation_tasks.get(run_id)
+            if generation is not None:
+                generation.task = asyncio.current_task()
 
         def timed_out() -> bool:
             # One predicate for every classification in this task, so the same
             # moment cannot land as `timeout` down one path and a Provider failure
-            # down another depending on whether an alarm happened to be armed.
-            return self._timed_out(run_id) or time.monotonic() >= cancel_at
+            # down another depending on whether the alarm happened to fire yet.
+            # The Deadline itself, not Deadline-minus-Grace: AD-6 fences the Run at
+            # 120 s and only then stops the agent, whose Grace comes after.
+            return self._timed_out(run_id) or time.monotonic() >= deadline_monotonic
 
         def commit_timeout() -> bool:
             return self._commit_timeout(conversation_id, run_id)
 
+        def fail_unknown() -> None:
+            # Nothing owns `fail()` yet, and an exception here would otherwise leave
+            # the Run `queued`/`running` with no terminal, no run.error and no
+            # stream.end.
+            if self.store.commit_failed(
+                conversation_id, run_id, _provider_failure("provider_unknown"), datetime.now(UTC)
+            ):
+                self._run_telemetry(conversation_id, run_id)
+
         try:
             try:
-                provider = self.provider
-                # Published BEFORE mark_running. A Cancel landing in that window wins
-                # the terminal CAS and mark_running then refuses, so no Provider call
-                # starts for an already-cancelled Run; published after it, that same
-                # Cancel would find no handle and the call would run uncancelled.
-                handle = self._publish_call_handle(run_id, provider)
+                # A Cancel landing before this wins the terminal CAS and mark_running
+                # then refuses, so no agent run starts for an already-cancelled Run.
+                # The Run was registered in `_generation_tasks` with this task's
+                # scheduling, so that same Cancel also reaches `abort` -- a no-op for a
+                # run_id the runtime has never seen.
                 started = self.store.mark_running(
-                    conversation_id,
-                    run_id,
-                    datetime.now(UTC),
-                    time.monotonic(),
-                    provider.binding_digest,
+                    conversation_id, run_id, datetime.now(UTC), time.monotonic(), provider.binding_digest
                 )
             except Exception:
-                # Nothing above owns `fail()` yet, and an exception here would
-                # otherwise leave the Run `queued` with no terminal and no stream.end.
-                if self.store.commit_failed(
-                    conversation_id,
-                    run_id,
-                    _provider_failure("provider_unknown"),
-                    datetime.now(UTC),
-                ):
-                    self._run_telemetry(conversation_id, run_id)
+                fail_unknown()
                 return
             if not started:
                 # Either a Cancel won the terminal CAS (this commit then loses it and
@@ -1806,52 +1856,56 @@ class ChatApplication:
                 return
             if lease is not None:
                 # Out of the queue: the Queued ceiling frees up here, the Active one
-                # only when this task ends. Inside the failure handler, because a
-                # raise here would otherwise leave the Run `running` for ever with no
-                # terminal, no run.error and no stream.end.
+                # only when this task ends.
                 try:
                     self.store.start_run(lease)
                 except Exception:
-                    if self.store.commit_failed(
-                        conversation_id,
-                        run_id,
-                        _provider_failure("provider_unknown"),
-                        datetime.now(UTC),
-                    ):
-                        self._run_telemetry(conversation_id, run_id)
+                    fail_unknown()
                     return
-            # The Deadline's own alarm, armed by the task that owns the call. This is
-            # what makes the Deadline hold with no client attached: without it a Run
-            # nobody polls could run past 120 s and block shutdown.
-            self._arm_deadline(
-                run_id,
-                cancel_at - time.monotonic(),
-                deadline_monotonic - time.monotonic(),
-            )
-            streamed = False
+            # The Deadline's own alarm, armed on the loop by the task that owns the
+            # call. This is what makes the Deadline hold with no client attached:
+            # without it a Run nobody polls could run past 120 s and block shutdown.
+            self._arm_deadline(run_id, deadline_monotonic)
+            # Every delta this Run committed, in order. Non-empty means the stream
+            # has started, which selects the stream-failure commit and is how an
+            # unsourced outcome that carried model text is caught below.
+            buffer: list[str] = []
 
             def fail(kind: str) -> bool:
                 # A Run that ran out of Deadline ends as `timeout` whatever the
-                # Provider said on its way out -- including the provider_cancelled
-                # our own Cancellation produced.
+                # Provider said on its way out -- including the provider_incomplete
+                # our own abort produced.
                 if timed_out():
                     return commit_timeout()
-                commit = self.store.commit_stream_failed if streamed else self.store.commit_failed
-                committed = commit(
-                    conversation_id,
-                    run_id,
-                    _provider_failure(kind),
-                    datetime.now(UTC),
-                )
+                commit = self.store.commit_stream_failed if buffer else self.store.commit_failed
+                committed = commit(conversation_id, run_id, _provider_failure(kind), datetime.now(UTC))
                 if committed:
                     self._run_telemetry(conversation_id, run_id)
                 return committed
 
-            if handle is None:
-                # Readiness promised a Provider whose calls can be stopped. Starting
-                # one we could never stop is worse than not starting it.
-                fail("provider_unknown")
-                return
+            # Both callbacks run on the agent loop, inside `provider.run`. A raise
+            # here propagates out of `provider.run(...)` and lands on the generic
+            # handler below, which maps it by its `.kind`. After a Cancel's terminal
+            # commit the store refuses every further step and delta, so a late
+            # callback ends the run instead of reaching the stream.
+            def on_step(step: AgentStepV1) -> None:
+                if timed_out():
+                    # Deadline reached mid-research: leave. `fail` commits the
+                    # `timeout` terminal, and that commit is what asks for the abort.
+                    raise _ProviderOutputRejected("provider_timeout")
+                if not isinstance(step, AgentStepV1) or not self.store.commit_step(
+                    conversation_id, run_id, step, datetime.now(UTC)
+                ):
+                    raise _ProviderOutputRejected("provider_invalid_response")
+
+            def on_delta(delta: str) -> None:
+                if timed_out():
+                    raise _ProviderOutputRejected("provider_timeout")
+                if not isinstance(delta, str) or not delta or _contains_unsafe_text(delta):
+                    raise _ProviderOutputRejected("provider_invalid_response")
+                if not self.store.commit_delta(conversation_id, run_id, delta, datetime.now(UTC)):
+                    raise _ProviderOutputRejected("provider_invalid_response")
+                buffer.append(delta)
 
             try:
                 if snapshot is not None:
@@ -1876,7 +1930,7 @@ class ChatApplication:
                         fail("provider_unknown")
                         return
                 if time.monotonic() >= deadline_monotonic:
-                    # Preparation alone consumed the Deadline; no Provider call starts.
+                    # Preparation alone consumed the Deadline; no agent run starts.
                     commit_timeout()
                     return
                 if dropped_turn_count and not self.store.commit_context_truncated(
@@ -1887,36 +1941,28 @@ class ChatApplication:
                     # receive a truncated answer with no record it happened.
                     fail("provider_unknown")
                     return
-                streamed = isinstance(provider, StreamingModelProviderPort)
-                if streamed:
-                    def commit_delta(delta: str) -> None:
-                        if timed_out():
-                            # Deadline reached mid-stream: start Structured
-                            # Cancellation, then leave. `fail` turns whatever the
-                            # Provider raises next into the `timeout` terminal.
-                            self._request_provider_cancel(run_id, timed_out=True)
-                            raise _ProviderOutputRejected("provider_timeout")
-                        if not isinstance(delta, str) or not delta or _contains_unsafe_text(delta):
-                            raise _ProviderOutputRejected("provider_invalid_response")
-                        if not self.store.commit_delta(
-                            conversation_id, run_id, delta, datetime.now(UTC)
-                        ):
-                            raise _ProviderOutputRejected("provider_invalid_response")
-
-                    output = provider.stream(request, commit_delta, handle)
-                else:
-                    output = provider.complete(request, handle)
-                if not isinstance(output, str):
-                    fail("provider_non_text")
-                    return
-                # Streamed output is committed raw: commit_stream_completed compares it
-                # byte-for-byte against the concatenated deltas, so normalizing here
-                # would turn every CRLF or non-NFC answer into a terminal failure.
-                if not streamed:
-                    output = _normalize_text(output)
-                if _contains_unsafe_text(output):
+                with self._generation_lock:
+                    correlation_id = self._generation_tasks[run_id].correlation_id
+                async with provider.run(run_id, correlation_id, request, on_step, on_delta) as result:
+                    pass
+                if not isinstance(result, AgentResultV1):
                     fail("provider_invalid_response")
                     return
+                if result.finish != "stop":
+                    fail("provider_incomplete")
+                    return
+                fixed = FIXED_REPLIES.get(result.outcome)
+                if fixed is not None:
+                    # AD-29: these outcomes never carry model text. A delta that got
+                    # here means the runtime broke the two-phase contract.
+                    if buffer:
+                        fail("provider_invalid_response")
+                        return
+                    on_delta(fixed)
+                # Committed raw: commit_stream_completed compares it byte-for-byte
+                # against the concatenated deltas, so normalizing here would turn
+                # every CRLF or non-NFC answer into a terminal failure.
+                output = "".join(buffer)
                 if not has_visible_text(output):
                     fail("provider_empty")
                     return
@@ -1925,41 +1971,38 @@ class ChatApplication:
                     # whole, it does not become a completed Message.
                     commit_timeout()
                     return
-                if streamed:
-                    if not self.store.commit_stream_completed(
-                        conversation_id,
-                        run_id,
-                        output,
-                        _provider_failure("provider_invalid_response"),
-                        datetime.now(UTC),
-                    ):
-                        fail("provider_invalid_response")
-                    else:
-                        self._run_telemetry(conversation_id, run_id)
+                if not self.store.commit_stream_completed(
+                    conversation_id,
+                    run_id,
+                    output,
+                    result,
+                    _provider_failure("provider_invalid_response"),
+                    datetime.now(UTC),
+                ):
+                    fail("provider_invalid_response")
                 else:
-                    if not self.store.commit_completed(
-                        conversation_id, run_id, output, datetime.now(UTC)
-                    ):
-                        fail("provider_invalid_response")
-                    else:
-                        self._run_telemetry(conversation_id, run_id)
+                    self._run_telemetry(conversation_id, run_id)
             except OutputLimitExceeded:
                 # A deployment ceiling, not a Provider fault. Named explicitly rather
                 # than left to the generic handler's getattr(exc, "kind") lookup,
                 # which is one rename away from silently becoming provider_unknown.
                 fail("capacity_exceeded")
             except asyncio.CancelledError:
-                # Only a Provider that raises CancelledError raw reaches here; the
-                # Direct adapter converts it to InvalidProviderOutput first and lands
-                # on the generic handler below. Kept because CancelledError is a
-                # BaseException -- without it the Run would never reach a terminal.
+                # The Task itself was cancelled: the Close Grace ran out on an agent
+                # that ignored its abort (the Run is already fenced, so this commit
+                # loses the CAS), or `shutdown`. CancelledError is a BaseException --
+                # without this the Run would never reach a terminal -- and it is
+                # re-raised so the Task still ends cancelled.
                 fail("provider_cancelled")
+                raise
             except Exception as exc:
+                # AgentRunError and _ProviderOutputRejected both carry a `.kind`
+                # that is a ProviderFailureKind; anything else is classified here.
                 if isinstance(exc, ContextIntegrityError):
                     self._integrity_poisoned = True
                 kind = getattr(exc, "kind", None)
                 if not isinstance(kind, str) or kind not in _PROVIDER_FAILURES:
-                    if isinstance(exc, (TimeoutError,)):
+                    if isinstance(exc, TimeoutError):
                         kind = "provider_timeout"
                     elif isinstance(exc, (ConnectionError, OSError)):
                         kind = "provider_transport"
@@ -1977,32 +2020,42 @@ class ChatApplication:
             if lease is not None:
                 self.store.release_run(lease)
 
-    def _arm_deadline(self, run_id: UUID, cancel_in: float, commit_in: float) -> None:
-        """Two one-shot alarms per Run, both retired by `_generate`'s own `finally`.
-        Not a watchdog sweeping every Run: they belong to the call they bound.
+    def _arm_deadline(self, run_id: UUID, deadline_monotonic: float) -> None:
+        """One one-shot alarm per Run at its Deadline, on the agent loop, retired by
+        `_generate`'s own `finally`. Not a watchdog sweeping every Run: it belongs to
+        the call it bounds. On fire it is AD-6's sequence: commit `timeout`, then one
+        abort, then the Close Grace (`_commit_timeout`)."""
+        self._set_deadline_timer(
+            run_id,
+            asyncio.get_running_loop().call_later(
+                max(0.0, deadline_monotonic - time.monotonic()),
+                self._deadline_commit,
+                run_id,
+                deadline_monotonic,
+            ),
+        )
 
-        They are separate because the frozen contract separates them. Cancellation
-        starts a Close Grace before the Deadline so the stream's close lands inside
-        the 120 s; the `timeout` terminal is only confirmed once the Deadline itself
-        has passed, which is also when `run_past_deadline` starts agreeing."""
-        timers = [
-            Timer(max(0.0, cancel_in), self._deadline_cancel, args=(run_id,)),
-            Timer(max(0.0, commit_in), self._deadline_commit, args=(run_id,)),
-        ]
-        for timer in timers:
-            timer.daemon = True
+    def _set_deadline_timer(self, run_id: UUID, timer: "asyncio.TimerHandle") -> None:
         with self._generation_lock:
             generation = self._generation_tasks.get(run_id)
-            if generation is None:
+            if generation is not None:
+                generation.timers = [timer]
                 return
-            generation.timers = timers
-        for timer in timers:
-            timer.start()
+        timer.cancel()
 
-    def _deadline_cancel(self, run_id: UUID) -> None:
-        self._request_provider_cancel(run_id, timed_out=True)
-
-    def _deadline_commit(self, run_id: UUID) -> None:
+    def _deadline_commit(self, run_id: UUID, deadline_monotonic: float) -> None:
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining > 0:
+            # asyncio may run a handle up to one clock resolution early (~16 ms on
+            # Windows), when `run_past_deadline` would still say no. Re-arm for the
+            # rest instead of letting the Run outlive its alarm.
+            self._set_deadline_timer(
+                run_id,
+                asyncio.get_running_loop().call_later(
+                    remaining, self._deadline_commit, run_id, deadline_monotonic
+                ),
+            )
+            return
         with self._generation_lock:
             generation = self._generation_tasks.get(run_id)
         if generation is not None:
@@ -2032,6 +2085,7 @@ class ChatApplication:
         `_readiness_lock` that produced the answer: computing the reason in a second
         acquisition lets a Gate change in between and yields a Record that disagrees
         with the answer this call returned."""
+        future: "concurrent.futures.Future | None" = None
         with self._readiness_lock:
             refusal = self._readiness_refusal_locked()
             if not self._bootstrap_is_valid_locked():
@@ -2051,32 +2105,38 @@ class ChatApplication:
                 self._probe_inflight = flight
                 self._clear_success_cache_locked()
                 try:
-                    Thread(
-                        target=self._run_probe,
-                        args=(flight,),
-                        daemon=True,
-                        name="aidd-provider-probe",
-                    ).start()
+                    # `probe()` is evaluated here, so a binding without an async
+                    # probe fails right here rather than on the loop.
+                    future = self.agent_loop.submit(
+                        asyncio.wait_for(flight.provider.probe(), self.PROBE_TIMEOUT_SECONDS)
+                    )
                 except Exception:
                     self._probe_inflight = None
                     return False, "provider_probe_failed"
 
+        if future is not None:
+            # Attached outside `_readiness_lock`: a probe that already finished runs
+            # its callback inline, on this thread, and `_run_probe` takes that lock.
+            future.add_done_callback(lambda done, flight=flight: self._run_probe(flight, done))
         if not flight.event.wait(max(0.0, flight.deadline - time.monotonic())):
-            return False, "provider_probe_failed"
+            # This call's own 2 s Readiness Probe Budget ran out while the Probe was
+            # still in flight (it may still resolve for the next call) -- distinct
+            # from every code `_run_probe` sets once the Probe HAS answered.
+            return False, "probe_timeout"
         with self._readiness_lock:
             ready = flight.result and self._cached_success_locked(time.monotonic())
             if ready:
                 return True, None
-            return False, self._readiness_refusal_locked() or "provider_probe_failed"
+            return False, flight.reason or self._readiness_refusal_locked() or "provider_probe_failed"
 
-    def _run_probe(self, flight: _ProbeFlight) -> None:
-        result: object = False
+    def _run_probe(self, flight: _ProbeFlight, future: "concurrent.futures.Future") -> None:
+        """The probe Future's done callback -- on the agent loop, or inline on the
+        submitting thread when the probe had already finished."""
+        result: object = None
         try:
-            probe = getattr(flight.provider, "probe", None)
-            if callable(probe):
-                result = probe()
-        except (Exception, asyncio.CancelledError):
-            result = False
+            result = future.result()
+        except BaseException:
+            result = None
 
         with self._readiness_lock:
             now = time.monotonic()
@@ -2085,17 +2145,37 @@ class ChatApplication:
                 and flight.provider is self._provider_binding
                 and flight.binding is self._bootstrap_binding
             )
+            # The Cache Key, re-read: a Provider whose Profile changed while its own
+            # probe was in flight has not been probed at all.
+            digest_current = (
+                flight.digest is not None
+                and flight.digest == _provider_profile_digest(self._provider_binding)
+            )
+            probe = result if isinstance(result, AgentProbeV1) else None
             flight.result = (
                 valid_binding
                 and now < flight.deadline
-                and type(result) is bool
-                and result is True
+                and probe is not None
+                and probe.ready
                 and self._bootstrap_is_valid_locked()
-                # The Cache Key, re-read: a Provider whose Profile changed while its
-                # own probe was in flight has not been probed at all.
-                and flight.digest is not None
-                and flight.digest == _provider_profile_digest(self._provider_binding)
+                and digest_current
             )
+            if flight.result:
+                flight.reason = None
+            elif not valid_binding or not digest_current:
+                # A rebind mid-flight, not a fact about this Probe -- distinct from
+                # every code below, which IS about what this Probe answered.
+                flight.reason = "digest_mismatch"
+            elif probe is None or not probe.provider_ok:
+                flight.reason = "provider_probe_failed"
+            elif not probe.wiki_ok:
+                flight.reason = "wiki_probe_failed"
+            elif not probe.context_ok:
+                flight.reason = "context_probe_failed"
+            else:
+                # `now >= flight.deadline` or a Gate refused after the Probe answered
+                # Ready -- `_probe_readiness` already has its own fallback for both.
+                flight.reason = None
             if not valid_binding:
                 self._policy_projection = None
             if flight.result:

@@ -21,11 +21,16 @@ id_rsa*
 .git
 .gitignore
 .venv
+.cache
 **/__pycache__
 **/*.py[cod]
 *.egg-info
 .pytest_cache
 dist
+agent/node_modules
+agent/*.test.mjs
+agent/test-helpers.mjs
+agent/test-fixtures
 .tmp-ux-validation
 .working
 

@@ -1,0 +1,42 @@
+[
+  {
+    "question": "GitHub Copilot의 agent mode는 pull request 리뷰를 어떤 방식으로 자동화하나요?",
+    "expected": "wiki_gap"
+  },
+  {
+    "question": "Aider라는 CLI 페어 프로그래밍 도구는 git 커밋 메시지를 어떤 방식으로 자동 생성하나요?",
+    "expected": "wiki_gap"
+  },
+  {
+    "question": "Devin이 자율적으로 버그를 수정할 때 사용하는 계획 수립 전략은 무엇인가요?",
+    "expected": "wiki_gap"
+  },
+  {
+    "question": "SWE-agent가 GitHub 이슈를 해결하기 위해 사용하는 agent-computer interface는 어떻게 구성되나요?",
+    "expected": "wiki_gap"
+  },
+  {
+    "question": "LangGraph로 멀티 에이전트 워크플로의 상태를 관리하는 방법은 무엇인가요?",
+    "expected": "wiki_gap"
+  },
+  {
+    "question": "김치찌개를 맛있게 끓이는 방법을 알려주세요.",
+    "expected": "out_of_scope"
+  },
+  {
+    "question": "축구 오프사이드 규칙을 쉽게 설명해 주세요.",
+    "expected": "out_of_scope"
+  },
+  {
+    "question": "제주도 여행 3박 4일 추천 코스를 알려주세요.",
+    "expected": "out_of_scope"
+  },
+  {
+    "question": "겨울철 감기 예방에 좋은 음식은 무엇인가요?",
+    "expected": "out_of_scope"
+  },
+  {
+    "question": "고양이를 처음 입양할 때 준비물은 무엇인가요?",
+    "expected": "out_of_scope"
+  }
+]

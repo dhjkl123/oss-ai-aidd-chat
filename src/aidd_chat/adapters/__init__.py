@@ -1,15 +1,9 @@
-from .direct import (
+from .fake_agent import (
     DETERMINISTIC_BINDING,
-    CancellableCallMixin,
-    DeterministicProvider,
-    InvalidProviderOutput,
+    FAKE_SOURCE,
+    FakeAgent,
+    LocalTestBinding,
     LocalTestTokenizerMixin,
-    OllamaConservativeTokenizerMixin,
-    OllamaLanProxyAdapter,
-    ProviderCallHandle,
-    PydanticAIDirectAdapter,
-    ollama_lan_proxy_binding,
-    verify_request_integrity,
 )
 from .memory import (
     AcceptQuestionResult,
@@ -28,36 +22,29 @@ from .memory import (
     RunObservationV1,
     TurnLimitReached,
 )
-from .retrieval import DISABLED_RETRIEVAL, DisabledRetrieval, RetrievalPort
+from .pi_sidecar import PiSidecarAdapter, map_failure
 
 __all__ = [
     "DETERMINISTIC_BINDING",
-    "DISABLED_RETRIEVAL",
+    "FAKE_SOURCE",
     "AcceptQuestionResult",
     "ActiveRunConflict",
-    "CancellableCallMixin",
     "CapacityExceeded",
     "ConversationExpired",
     "ConversationNotFound",
     "ConversationState",
     "DeploymentLimits",
-    "DeterministicProvider",
-    "DisabledRetrieval",
+    "FakeAgent",
     "IdempotencyConflict",
+    "LocalTestBinding",
     "InMemoryConversationStore",
-    "InvalidProviderOutput",
     "LocalTestTokenizerMixin",
-    "OllamaConservativeTokenizerMixin",
-    "OllamaLanProxyAdapter",
-    "ProviderCallHandle",
-    "PydanticAIDirectAdapter",
-    "RetrievalPort",
+    "PiSidecarAdapter",
     "RetryExhausted",
     "RetryNotRetryable",
     "RunLease",
     "RunNotFound",
     "RunObservationV1",
     "TurnLimitReached",
-    "ollama_lan_proxy_binding",
-    "verify_request_integrity",
+    "map_failure",
 ]
