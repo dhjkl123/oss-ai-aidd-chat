@@ -48,3 +48,10 @@ opencode.jsonc
 
 # Editor settings
 .vscode/
+
+# Requirement traceability: track only the PRD folders so kode-harness-lite can show change history from git
+!_bmad-output/
+_bmad-output/*
+!_bmad-output/planning-artifacts/
+_bmad-output/planning-artifacts/*
+!_bmad-output/planning-artifacts/prds/
