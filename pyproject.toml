@@ -45,3 +45,13 @@ markers = [
 # mistyped one would otherwise register silently and `-m release_suite` would quietly
 # run fewer items than the evidence claims.
 addopts = "--strict-markers"
+
+[tool.pyright]
+# src Layout + .venv. 둘 다 알려 주지 않으면 pyright가 `fastapi`도 `aidd_chat`도
+# 미해결 import로 본다 -- Test와 Runtime은 pytest의 `pythonpath`와 Editable Install이
+# 각각 해결하므로, 이 block은 오직 Language Server를 위한 것이다.
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src"]
+pythonVersion = "3.12"
+include = ["src", "tests"]
