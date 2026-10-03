@@ -125,3 +125,21 @@ tests/               # contract, application, adapter and browser tests
 - 검색 도구와 색인은 없고, `index.md`가 유일한 카탈로그다. 규모가 작으므로 초기 도구는 `index.md` 읽기, 파일 읽기, 텍스트 검색(grep류)으로 충분할 수 있다. Vector 색인은 범위 밖이다.
 - frontmatter: `title, created, updated, type, tags, sources, confidence, contested, contradictions`. 근거 표시(FR-10)에 `title`, `confidence`, `contested`를 사용한다.
 - `scripts/validate_wiki.py`는 Wiki 계약 Linter다. 에이전트가 쓰기를 하지 않으므로 실행 대상은 아니지만 SM-9 확인에 참고할 수 있다.
+
+## 2026-10-01 추가: Model 교체와 범용 Wiki의 구현 메모
+
+이 절은 `prd.md` 2026-10-01 개정(FR-12, FR-13)의 구현 근거다. 운영자용 설명은 README의 `모델 조건`과 `지원하는 Wiki 구조`에 있다.
+
+### Model 교체(FR-12)
+
+- 설정: `OLLAMA_BASE_URL`(OpenAI 호환 `/v1`의 Origin)과 Model 태그(예: `qwen3.5:9b`). `OLLAMA_BASE_URL`이 비면 Deterministic FakeAgent가 묶인다.
+- 컨텍스트 길이(C-12.2): Ollama 서버의 `OLLAMA_CONTEXT_LENGTH`는 `.env`의 `MODEL_CONTEXT_WINDOW` 이상이어야 한다(하한 23740, AD-30 예산). Ollama는 컨텍스트 창을 넘는 앞부분을 조용히 버리므로, 기동 시 Context Probe가 창 크기에 가까운 길이의 요청으로 확인하고 창이 모자라면 `/ready`를 503으로 둔다.
+- 도구 호출(C-12.3): `ollama show <model>`의 Capabilities에 `tools`가 있어야 한다. Readiness Probe는 도구 없이 호출하므로 미지원 Model도 `/ready` 204로 뜨고, 첫 질문에서 Provider 오류로 실패한다.
+- Tokenizer(C-12.4): `uv run python scripts/fetch_tokenizer.py --repo <hf-repo>`로 Model 계열에 맞는 Tokenizer를 받는다.
+
+### 범용 Markdown Wiki(FR-13)
+
+- 제외 폴더는 `agent/wiki-tools.mjs`의 `EXCLUDED`와 `contracts.EXCLUDED_WIKI_DIRS`에 같은 값으로 있다(`inbox/`, `docs/`, `.obsidian/`, `.git/`, `.ua/`, 대소문자 무시).
+- `index.md`가 없으면 `/ready`가 503이다.
+- 검색은 대소문자를 무시한 문자열 일치다. 형태소 분석과 Embedding은 없다. 파일마다 첫 일치 한 줄씩, 최대 20건을 돌려준다. 검색마다 모든 파일을 훑으므로 문서가 수천 개면 느려질 수 있다(C-9.4의 재검토 조건과 같다).
+- System Prompt는 AIDD 도구·워크플로 도메인을 가정한다. 다른 주제의 Wiki에서는 `wiki_gap`/`out_of_scope` 판정과 인사 문구가 어긋날 수 있다(OQ-2).

@@ -139,6 +139,28 @@ test("module source contains no write API", () => {
   assert.equal(/writeFile|appendFile|rename|unlink|rmSync|mkdir|createWriteStream/.test(source), false);
 });
 
+test("a Wiki without a root index.md is not readable", () => {
+  const root = mkdtempSync(join(tmpdir(), "wiki-noindex-"));
+  writeFileSync(join(root, "page.md"), "# page\n");
+  assert.equal(new WikiRoot(root).indexReadable(), false);
+  writeFileSync(join(root, "index.md"), "# index\n");
+  assert.equal(new WikiRoot(root).indexReadable(), true);
+});
+
+test("a flat Wiki with no canonical folders and no frontmatter still searches and reads", async () => {
+  const root = mkdtempSync(join(tmpdir(), "wiki-flat-"));
+  writeFileSync(join(root, "index.md"), "# index\n- [[notes/flat-page]]\n");
+  mkdirSync(join(root, "notes"));
+  writeFileSync(join(root, "notes", "flat-page.md"), "flatwordz lives here\n");
+  const { wikiSearch, wikiRead } = setup(LIMITS, root);
+  const paths = JSON.parse(text(await wikiSearch.execute("c1", { query: "FLATWORDZ" }))).map((hit) => hit.path);
+  assert.deepEqual(paths, ["notes/flat-page.md"]);
+  const result = JSON.parse(text(await wikiRead.execute("c2", { path: "notes/flat-page.md" })));
+  assert.equal(result.title, "flat-page");
+  assert.equal(result.confidence, null);
+  assert.equal(result.contested, false);
+});
+
 test("an excluded folder is excluded whatever its on-disk case", async () => {
   const root = mkdtempSync(join(tmpdir(), "wiki-case-"));
   writeFileSync(join(root, "index.md"), "# index\n");

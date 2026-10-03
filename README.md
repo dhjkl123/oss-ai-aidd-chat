@@ -5,20 +5,21 @@
 
 ## 개요
 
-시스템은 세 덩어리다. **Wiki agent**가 Wiki를 읽고 근거 있는 답만 만들고, **Cite**가 대화·Run·
-상한을 관리하며, **소스 수집 배치**가 Wiki에 실릴 원본 문서를 채운다. 점선 Box는 아직 구현되지
-않은 계획이다 -- 소스 수집 배치와 그 결과물(수집 Corpus)은 이 앱 범위 밖이다.
+Markdown Wiki 폴더와 Ollama Model을 물리면 Wiki 근거로만 답하는 챗봇이 된다. **Cite**가 대화·
+Run·상한을 관리하고, **Wiki agent**가 Wiki를 읽기 전용으로 탐색해 근거 있는 답만 만든다. Model은
+태그만 바꾸면 교체된다(조건은 [모델 조건](#모델-조건)).
 
 ![아키텍처](docs/architecture.svg)
 
 편집용 원본은 [`docs/architecture.excalidraw`](docs/architecture.excalidraw)이다
 (excalidraw.com에서 열어 수정한 뒤 SVG로 다시 export한다).
 
-| 덩어리 | 지금 상태 |
-|--------|-----------|
-| Wiki agent | pi sidecar(Node)가 Wiki를 읽기 전용 도구로 탐색한 뒤 Ollama(OpenAI 호환)로 답을 짓는다. `OLLAMA_BASE_URL`이 비면 Deterministic FakeAgent가 묶인다. |
+| 구성 | 역할 |
+|------|------|
 | Cite | HTTP API + SSE, Domain 상태·용량 상한, `AgentRuntimePort` 뒤의 Adapters. 모든 상태가 In-memory라 Worker 1개·Replica 1개 전제다. |
-| 소스 수집 배치 | 계획. Wiki 작업본을 채우고 검증된 commit만 읽기 전용 clone(`WIKI_ROOT`)으로 넘긴다. |
+| Wiki agent | pi sidecar(Node)가 Wiki를 읽기 전용 도구로 탐색(Research)한 뒤, 읽은 문서만으로 답을 짓는다(Compose). `OLLAMA_BASE_URL`이 비면 Deterministic FakeAgent가 묶인다. |
+| Ollama | OpenAI 호환 `/v1`로 호출하는 Local·LAN Model. [모델 조건](#모델-조건)을 만족하면 계열은 가리지 않는다. |
+| Markdown Wiki | `WIKI_ROOT`의 `.md` 폴더. [지원하는 Wiki 구조](#지원하는-wiki-구조) 참고. |
 
 ## Quick start
 
@@ -61,6 +62,42 @@ Docker 실행법은 [`docs/wiki-agent-run.md`](docs/wiki-agent-run.md)에 있다
 로컬 LLM(Ollama)은 Tailscale 네트워크 위의 Proxy로 접근한다. `.env`의 `OLLAMA_BASE_URL`에
 그 Proxy의 Origin(`http(s)://host[:port]`)만 넣으면 되고, Model 이름은 태그까지 정확히 쓴다
 (예: `qwen3.5:9b`). 나머지 설정은 [`docs/wiki-agent-run.md`](docs/wiki-agent-run.md)에 있다.
+
+### 모델 조건
+
+Ollama 쪽에서 운영자가 맞춰야 하는 조건이 둘 있다. 앱은 맞췄는지 확인만 한다.
+
+- **컨텍스트 길이** -- Ollama 서버의 `OLLAMA_CONTEXT_LENGTH`를 `.env`의 `MODEL_CONTEXT_WINDOW`
+  이상으로 둔다(하한 23740). Ollama는 창을 넘는 앞부분을 조용히 버리므로, 기동 시 Context
+  Probe가 창 근처 길이의 요청으로 이를 확인하고 모자라면 `/ready`를 503으로 둔다.
+- **도구 호출(tools) 지원** -- Agent는 도구 호출로 Wiki를 탐색한다. `ollama show <model>`의
+  Capabilities에 `tools`가 있어야 한다. Readiness Probe는 도구 없이 호출하므로, 미지원 Model은
+  `/ready` 204로 뜨지만 첫 질문에서 Provider 오류로 실패한다.
+
+Model을 다른 계열로 바꾸면 tokenizer도 그 Model의 것으로 바꾼다
+(`uv run python scripts/fetch_tokenizer.py --repo <hf-repo>`).
+
+## 지원하는 Wiki 구조
+
+llm-wiki식 Markdown 폴더를 기준으로 만들었지만, 아래 조건만 맞으면 어떤
+폴더든 읽는다. Wiki는 읽기만 하고 절대 쓰지 않는다.
+
+- **`.md` 파일만** -- `WIKI_ROOT` 아래를 하위 폴더까지 읽는다. `.txt`·PDF·이미지 등 다른 형식은
+  무시한다.
+- **루트의 `index.md`는 필수** -- Agent가 가장 먼저 읽는 목차다. 없으면 `/ready`가 503이다.
+- **제외 폴더** -- `inbox/`, `docs/`, `.obsidian/`, `.git/`, `.ua/`(대소문자 무시)는 목록·검색·
+  읽기에서 모두 빠진다.
+- **우선 폴더(선택)** -- `entities/`, `concepts/`, `comparisons/`, `queries/`의 문서가 검색 결과
+  앞에 오고, `raw/`는 정리된 문서로 답할 수 없을 때만 찾는다. 이 폴더들이 없어도 동작한다.
+- **Frontmatter(선택)** -- `title`(없으면 파일명), `confidence: high|medium|low`,
+  `contested: true`. 근거 목록에 "신뢰도 낮음"·"논쟁 중" 표시로 나타난다.
+- **경로 제한** -- 루트 밖을 가리키는 경로와 Symlink는 읽지 않는다.
+- **검색 방식** -- 대소문자를 무시한 문자열 일치다(형태소 분석·Embedding 없음). 파일마다 첫
+  일치 한 줄씩, 최대 20건을 돌려준다. 매 검색이 모든 파일을 훑으므로 문서가 수천 개면 느려질 수
+  있다.
+
+현재 System Prompt는 AIDD 도구·워크플로 도메인을 가정한다. 다른 주제의 Wiki를 물리면
+`wiki_gap`/`out_of_scope` 판정과 인사 문구가 어긋날 수 있다.
 
 ## `/ready`가 503일 때
 
